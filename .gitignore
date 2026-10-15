@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+bot_data.db
+bot_data.db-journal
+transcript-*.html
+store_banner.png
