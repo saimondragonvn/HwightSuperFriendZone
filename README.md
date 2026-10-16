@@ -179,6 +179,7 @@ Hoặc chạy lệnh trong terminal:
 | :--- | :--- |
 | `>profile [@user]` | Thẻ hồ sơ thành viên VIP: tổng tiền đã chi, tiến độ mốc VIP, số đơn hàng và Xu |
 | `>backupdb` | Tải trực tiếp file database `bot_data.db` về máy tính qua Discord (Chỉ Admin) |
+| `>restoredb` | Đính kèm file `bot_data.db` để nạp/khôi phục trực tiếp dữ liệu lên bot (Chỉ Admin) |
 | `>serverinfo` | Xem tổng quan thông tin, cấp độ Boost và trạng thái Server |
 | `>announce <#kênh> <nội dung>` | Đăng thông báo Store chính thức vào kênh chỉ định |
 | `>genkey @Role <ngày> [số lượng]` | Tạo Key VIP cấp Role có thời hạn (0 = vĩnh viễn) |

@@ -5979,6 +5979,44 @@ async def cmd_backupdb(ctx: commands.Context):
         await ctx.reply(f"❌ Lỗi khi gửi file sao lưu: {e}")
 
 
+@bot.command(name="restoredb", aliases=["khoiphucdb", "uploaddb"])
+@commands.has_permissions(administrator=True)
+async def cmd_restoredb(ctx: commands.Context):
+    """Khôi phục hoặc nạp dữ liệu database bot_data.db lên bot từ file đính kèm (Chỉ Admin)."""
+    if not ctx.message.attachments:
+        return await ctx.reply("❌ Vui lòng đính kèm file `bot_data.db` khi gõ lệnh `>restoredb`!")
+
+    att = ctx.message.attachments[0]
+    if not att.filename.endswith(".db"):
+        return await ctx.reply("❌ File đính kèm phải có đuôi `.db` (ví dụ: `bot_data.db`)!")
+
+    try:
+        content = await att.read()
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+
+        with open(DB_PATH, "wb") as f:
+            f.write(content)
+
+        # Chạy lại init_db() để đảm bảo cấu trúc bảng đầy đủ
+        init_db()
+
+        file_size_kb = len(content) / 1024
+        is_vol = bool(os.getenv("DB_PATH") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.path.isdir("/data"))
+        vol_status = "💾 **Persistent Volume:** Đã lưu vĩnh viễn vào Volume!" if is_vol else "⚠️ **Lưu ý:** Bot chưa gắn Volume, dữ liệu này có thể mất nếu redeploy!"
+
+        await ctx.reply(
+            f"✅ **ĐÃ NẠP / KHÔI PHỤC DATABASE THÀNH CÔNG!**\n"
+            f"┃ ➡️ **Dung lượng:** `{file_size_kb:.2f} KB`\n"
+            f"┃ ➡️ **Vị trí lưu:** `{DB_PATH}`\n"
+            f"┃ ➡️ **Trạng thái:** {vol_status}\n\n"
+            f"🎉 Toàn bộ dữ liệu cấu hình, cấp độ và mốc VIP đã sẵn sàng hoạt động!"
+        )
+    except Exception as e:
+        await ctx.reply(f"❌ Lỗi khi nạp dữ liệu database: {e}")
+
+
 # --- 6. MENU TRỢ GIÚP TỔNG HỢP (>help) ---
 @bot.command(name="help", aliases=["lenh", "trogiup", "commands"])
 async def cmd_help(ctx: commands.Context):
