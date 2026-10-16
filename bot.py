@@ -5817,6 +5817,8 @@ async def start_webserver():
     try:
         app = web.Application()
         app.router.add_get("/", handle_health)
+        app.router.add_post("/", handle_bank_webhook)
+        app.router.add_post("/webhook", handle_bank_webhook)
         app.router.add_post("/webhook/bank", handle_bank_webhook)
 
         runner = web.AppRunner(app)
