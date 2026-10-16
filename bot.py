@@ -50,8 +50,17 @@ TOKEN = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Token bảo mật SePay/Casso (tùy chọn)
 PORT = int(os.getenv("PORT", 8080))
-DEFAULT_DB_PATH = "/data/bot_data.db" if os.path.isdir("/data") else "bot_data.db"
-DB_PATH = os.getenv("DB_PATH", DEFAULT_DB_PATH)
+
+# Cấu hình đường dẫn Database SQLite lưu trữ vĩnh viễn (Railway Persistent Volume)
+railway_vol = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+if os.getenv("DB_PATH"):
+    DB_PATH = os.getenv("DB_PATH")
+elif railway_vol:
+    DB_PATH = os.path.join(railway_vol, "bot_data.db")
+elif os.path.isdir("/data"):
+    DB_PATH = "/data/bot_data.db"
+else:
+    DB_PATH = "bot_data.db"
 
 # Cấu hình ngân hàng mặc định qua biến môi trường (nếu chưa cấu hình trong DB)
 ENV_BANK_CODE = os.getenv("BANK_CODE", "MB")
@@ -2367,6 +2376,12 @@ async def on_ready():
             pass
 
     print(f"✅ Bot đã sẵn sàng hoạt động: {bot.user} (ID: {bot.user.id})")
+    is_persistent = bool(os.getenv("DB_PATH") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.path.isdir("/data"))
+    print(f"📁 Database Path: {os.path.abspath(DB_PATH)}")
+    if is_persistent:
+        print("💾 DỮ LIỆU AN TOÀN: Bot đã kết nối Persistent Volume thành công!")
+    else:
+        print("⚠️ CẢNH BÁO MẤT DỮ LIỆU: Bot đang chạy trên ổ đĩa tạm (chưa tạo Volume trên Railway)! Dữ liệu sẽ mất khi redeploy.")
 
 
 @bot.event
@@ -5939,6 +5954,29 @@ async def cmd_announce(ctx: commands.Context, channel: discord.TextChannel, *, c
     embed.set_footer(text=f"Đăng bởi {ctx.author.display_name} • Store Announcement", icon_url=ctx.author.display_avatar.url)
     await channel.send(embed=embed)
     await ctx.reply(f"✅ Đã gửi thông báo đến kênh {channel.mention} thành công!")
+
+
+@bot.command(name="backupdb", aliases=["saoluudb", "downloaddb"])
+@commands.has_permissions(administrator=True)
+async def cmd_backupdb(ctx: commands.Context):
+    """Tải trực tiếp file database bot_data.db về máy tính qua Discord (Chỉ Admin)."""
+    if not os.path.exists(DB_PATH):
+        return await ctx.reply("❌ File database chưa tồn tại trên hệ thống!")
+    try:
+        file_size_kb = os.path.getsize(DB_PATH) / 1024
+        is_vol = bool(os.getenv("DB_PATH") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.path.isdir("/data"))
+        vol_status = "💾 **Persistent Volume:** Đã kết nối" if is_vol else "⚠️ **Persistent Volume:** CHƯA GẮN (Dữ liệu tạm)"
+        await ctx.reply(
+            content=(
+                f"📦 **SAO LƯU DỮ LIỆU BOT THÀNH CÔNG:**\n"
+                f"┃ ➡️ **Dung lượng:** `{file_size_kb:.2f} KB`\n"
+                f"┃ ➡️ **Đường dẫn:** `{DB_PATH}`\n"
+                f"┃ ➡️ **Trạng thái:** {vol_status}"
+            ),
+            file=discord.File(DB_PATH, filename="bot_data.db"),
+        )
+    except Exception as e:
+        await ctx.reply(f"❌ Lỗi khi gửi file sao lưu: {e}")
 
 
 # --- 6. MENU TRỢ GIÚP TỔNG HỢP (>help) ---
