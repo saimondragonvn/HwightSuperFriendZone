@@ -326,6 +326,19 @@ def init_db():
                 UNIQUE (guild_id, level_req)
             )
         """)
+        # 18. Bảng lưu vết các mã thanh toán đang chờ (VietQR / Webhook routing chính xác kênh)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                user_id INTEGER DEFAULT 0,
+                amount INTEGER DEFAULT 0,
+                note TEXT DEFAULT '',
+                created_at TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -474,6 +487,80 @@ def build_vietqr_url(bank_code: str, account_no: str, account_name: str, amount:
     if info_clean:
         url += f"&addInfo={info_clean}"
     return url
+
+
+def register_pending_payment(code: str, guild_id: int, channel_id: int, user_id: int = 0, amount: int = 0, note: str = ""):
+    """Đăng ký mã giao dịch đang chờ thanh toán để webhook ngân hàng gửi đúng kênh."""
+    clean_code = re.sub(r"\s+", "", code.strip().upper())
+    now_str = datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pending_payments (code, guild_id, channel_id, user_id, amount, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (clean_code, guild_id, channel_id, user_id, amount, note, now_str),
+        )
+        conn.commit()
+
+
+async def resolve_payment_channel_and_user(desc: str):
+    """
+    Phân tích nội dung chuyển khoản để tìm chính xác TextChannel Discord và User ID.
+    Hỗ trợ cả phòng Ticket và các phòng gõ lệnh >qr.
+    """
+    desc_upper = desc.upper().strip()
+
+    # 1. Tìm các tiền tố phổ biến: TICKETxxxx, HDxxxx, QRxxxx, CKxxxx
+    code_matches = re.findall(r"(TICKET\s*\d+|HD\s*\d+|QR\s*\d+|CK\s*\d+)", desc_upper)
+    candidate_codes = [re.sub(r"\s+", "", m) for m in code_matches]
+
+    # 2. Tìm các chuỗi 4-8 chữ số độc lập
+    num_matches = re.findall(r"\b(\d{4,8})\b", desc_upper)
+    for n in num_matches:
+        candidate_codes.append(f"TICKET{n}")
+        candidate_codes.append(f"HD{n}")
+        candidate_codes.append(f"QR{n}")
+        candidate_codes.append(f"CK{n}")
+        candidate_codes.append(n)
+
+    # 3. Tra cứu trong bảng pending_payments
+    with get_db() as conn:
+        for c in candidate_codes:
+            row = conn.execute(
+                "SELECT * FROM pending_payments WHERE code = ? OR code LIKE ? ORDER BY id DESC LIMIT 1",
+                (c, f"%{c}%"),
+            ).fetchone()
+            if row:
+                ch_id = row["channel_id"]
+                ch = bot.get_channel(ch_id)
+                if not ch:
+                    try:
+                        ch = await bot.fetch_channel(ch_id)
+                    except Exception:
+                        ch = None
+                if ch:
+                    return ch, row["user_id"], row["code"]
+
+    # 4. Fallback: Nếu giao dịch tạo trước khi có bảng pending_payments, dò theo topic/tên kênh
+    for target_code in num_matches:
+        for guild in bot.guilds:
+            for ch in guild.text_channels:
+                matched = (
+                    ch.name.endswith(f"-{target_code}")
+                    or f"ticket{target_code}" in ch.name.lower()
+                    or (ch.topic and f"TICKET{target_code}" in ch.topic.upper())
+                    or (ch.topic and target_code in ch.topic)
+                )
+                if matched:
+                    u_id = 0
+                    if ch.topic:
+                        m_uid = re.search(r"\((\d{15,21})\)", ch.topic)
+                        if m_uid:
+                            u_id = int(m_uid.group(1))
+                    return ch, u_id, f"TICKET{target_code}"
+
+    return None, 0, None
 
 
 # =============================================================================
@@ -699,6 +786,15 @@ async def create_store_ticket_channel(
         topic=f"Ticket của {user.display_name} ({user.id}) | Mã: TICKET{ticket_num}",
     )
 
+    register_pending_payment(
+        code=f"TICKET{ticket_num}",
+        guild_id=guild.id,
+        channel_id=ticket_channel.id,
+        user_id=user.id,
+        amount=0,
+        note=f"Ticket {category_name}",
+    )
+
     embed = discord.Embed(
         title="🪽🪽 TICKET THUÊ ACC & DỊCH VỤ SỐ 🪽🪽",
         description=(
@@ -853,8 +949,54 @@ class TicketControlView(ui.View):
     )
     async def show_qr(self, interaction: discord.Interaction, button: ui.Button):
         settings = get_guild_settings(interaction.guild_id)
-        # Trích xuất mã TICKETxxxx từ topic kênh hoặc tên kênh nếu có
-        ticket_code = interaction.channel.name.split("-")[-1].upper()
+        channel = interaction.channel
+
+        # 1. Lấy mã Ticket chuẩn từ topic kênh
+        ticket_code = None
+        if channel.topic:
+            m_topic = re.search(r"TICKET\s*(\d+)", channel.topic.upper())
+            if m_topic:
+                ticket_code = m_topic.group(1)
+
+        # 2. Nếu không có trong topic, lấy từ tên kênh (ví dụ ticket-user-1234)
+        if not ticket_code:
+            m_name = re.search(r"ticket-[^-]+-(\d+)", channel.name.lower())
+            if m_name:
+                ticket_code = m_name.group(1)
+
+        # 3. Tra cứu từ database pending_payments theo channel_id
+        if not ticket_code:
+            with get_db() as conn:
+                p_row = conn.execute(
+                    "SELECT code FROM pending_payments WHERE channel_id = ? ORDER BY id DESC LIMIT 1",
+                    (channel.id,),
+                ).fetchone()
+                if p_row:
+                    m_code = re.search(r"(\d+)", p_row["code"])
+                    if m_code:
+                        ticket_code = m_code.group(1)
+
+        # 4. Nếu vẫn chưa có, tạo mã mới
+        if not ticket_code:
+            ticket_code = str(random.randint(1000, 9999))
+            try:
+                cur_topic = channel.topic or ""
+                await channel.edit(topic=f"{cur_topic} | Mã: TICKET{ticket_code}".strip(" |"))
+            except Exception:
+                pass
+
+        full_code = f"TICKET{ticket_code}"
+
+        # Đăng ký vào pending_payments liên kết chặt chẽ với channel.id
+        register_pending_payment(
+            code=full_code,
+            guild_id=interaction.guild_id,
+            channel_id=channel.id,
+            user_id=interaction.user.id,
+            amount=0,
+            note="Ticket Payment",
+        )
+
         add_info = f"TICKET {ticket_code}"
         qr_url = build_vietqr_url(
             settings["bank_code"], settings["account_no"], settings["account_name"], 0, add_info
@@ -870,7 +1012,7 @@ class TicketControlView(ui.View):
                 f"Chủ TK    : {settings['account_name']}\n"
                 f"Nội dung  : {add_info}\n"
                 f"```\n"
-                f"✨ *Hệ thống Check Bill tự động sẽ xác nhận ngay khi chuyển khoản thành công!*"
+                f"✨ *Hệ thống Check Bill tự động sẽ xác nhận và gửi ting ting ngay tại phòng {channel.mention}!*"
             ),
             color=COLOR_CYAN,
         )
@@ -1808,26 +1950,103 @@ def make_spending_progress_bar(current: int, target: int, length: int = 10) -> s
     return f"[`{bar}`] **{percent}%**"
 
 
+async def ensure_guild_vip_tiers(guild: discord.Guild):
+    """
+    Tự động kiểm tra và khởi tạo các mốc Role VIP cho Server nếu chưa có.
+    Tìm role có sẵn hoặc tạo mới nếu bot có quyền manage_roles.
+    """
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (guild.id,),
+        ).fetchall()
+        if tiers:
+            return tiers
+
+        # Nếu chưa có mốc nào, tự động tạo các Role VIP chuẩn: 50k, 100k, 200k, 500k, 1M, 2M, 5M
+        now_str = datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M")
+        for amount, default_name, color in DEFAULT_VIP_TIERS_CONFIG:
+            matched_role = discord.utils.find(lambda r: r.name.lower() == default_name.lower(), guild.roles)
+            if not matched_role and guild.me.guild_permissions.manage_roles:
+                try:
+                    matched_role = await guild.create_role(
+                        name=default_name,
+                        color=color,
+                        hoist=True,
+                        reason="Tự động tạo Role VIP cho hệ thống chi tiêu",
+                    )
+                except Exception as e:
+                    print(f"⚠️ Không thể tạo role {default_name}: {e}")
+
+            if matched_role:
+                conn.execute(
+                    """
+                    INSERT INTO vip_tiers (guild_id, tier_name, required_spent, role_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (guild.id, matched_role.name, amount, matched_role.id, now_str),
+                )
+        conn.commit()
+
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (guild.id,),
+        ).fetchall()
+        return tiers
+
+
 async def check_and_upgrade_vip_role(guild: discord.Guild, member: discord.Member, notify_channel: discord.TextChannel = None) -> list:
     """
     Tự động kiểm tra tổng chi tiêu của khách hàng.
     Phân biệt chính xác từng mốc VIP: Tự động trao Role mốc cao nhất đạt được,
     và thu hồi các Role VIP mốc thấp hơn để thành viên có đúng 1 danh hiệu VIP tương xứng!
     """
-    total_spent, _ = get_user_total_spent(guild.id, member.id)
-    with get_db() as conn:
-        tiers = conn.execute(
-            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
-            (guild.id,),
-        ).fetchall()
+    if not isinstance(member, discord.Member):
+        fetched = guild.get_member(member.id)
+        if not fetched:
+            try:
+                fetched = await guild.fetch_member(member.id)
+            except Exception:
+                fetched = None
+        if fetched:
+            member = fetched
+        else:
+            return []
 
+    total_spent, _ = get_user_total_spent(guild.id, member.id)
+
+    # Đảm bảo server đã có các mốc VIP (nếu chưa có thì tự động tạo)
+    tiers = await ensure_guild_vip_tiers(guild)
     if not tiers:
+        if notify_channel:
+            await notify_channel.send(
+                "💡 Server chưa thiết lập mốc Role VIP nào! Admin hãy gõ lệnh `>setupviproles` để tự động tạo trọn bộ Role VIP (50k - 5M)."
+            )
         return []
 
     # Tìm mốc VIP cao nhất mà khách hàng đạt được
     highest_tier = None
     for tier in tiers:
         role = guild.get_role(tier["role_id"])
+        # Nếu role bị xóa trên Discord nhưng mốc vẫn còn trong DB, tự động tìm lại hoặc tạo lại
+        if not role:
+            role = discord.utils.find(lambda r: r.name.lower() == tier["tier_name"].lower(), guild.roles)
+            if not role and guild.me.guild_permissions.manage_roles:
+                try:
+                    target_color = get_vip_color_by_amount(tier["required_spent"])
+                    role = await guild.create_role(
+                        name=tier["tier_name"],
+                        color=target_color,
+                        hoist=True,
+                        reason="Tự động tái tạo Role VIP bị thiếu",
+                    )
+                except Exception:
+                    role = None
+            if role:
+                with get_db() as conn:
+                    conn.execute("UPDATE vip_tiers SET role_id = ? WHERE id = ?", (role.id, tier["id"]))
+                    conn.commit()
+
         if role and total_spent >= tier["required_spent"]:
             highest_tier = (tier, role)
 
@@ -1835,6 +2054,32 @@ async def check_and_upgrade_vip_role(guild: discord.Guild, member: discord.Membe
         return []
 
     target_tier, target_role = highest_tier
+
+    # Kiểm tra phân quyền Discord (Role Hierarchy)
+    if not guild.me.guild_permissions.manage_roles:
+        if notify_channel:
+            await notify_channel.send("❌ Bot thiếu quyền **Quản Lý Vai Trò (Manage Roles)** để cấp Role VIP trên server!")
+        return []
+
+    if guild.me.top_role <= target_role:
+        warning_embed = discord.Embed(
+            title="⚠️ LỖI THỨ BẬC VAI TRÒ (DISCORD ROLE HIERARCHY)",
+            description=(
+                f"Khách hàng {member.mention} đã đạt mốc chi tiêu **`{format_vnd(target_tier['required_spent'])}`** "
+                f"và đủ điều kiện nhận Role {target_role.mention}!\n\n"
+                f"⛔ **Tuy nhiên Bot KHÔNG THỂ cấp Role vì:**\n"
+                f"Vai trò của Bot ({guild.me.top_role.mention}) đang nằm **DƯỚI** vai trò {target_role.mention} "
+                f"trong danh sách Vai Trò của Server!\n\n"
+                f"👉 **CÁCH KHẮC PHỤC NGAY (CHỈ MẤT 5 GIÂY):**\n"
+                f"1. Vào **Cài Đặt Máy Chủ** ➔ **Vai Trò (Roles)**\n"
+                f"2. Nắm và **kéo Role của Bot lên cao hơn** các Role VIP!\n"
+                f"3. Gõ `>syncvip {member.mention}` để Bot trao ngay Role VIP cho bạn!"
+            ),
+            color=COLOR_DANGER,
+        )
+        if notify_channel:
+            await notify_channel.send(embed=warning_embed)
+        return []
 
     # Thu hồi các role VIP mốc thấp hơn nếu khách đang giữ để tránh trùng lặp
     for tier in tiers:
@@ -1854,6 +2099,8 @@ async def check_and_upgrade_vip_role(guild: discord.Guild, member: discord.Membe
             upgraded_tiers.append((target_tier, target_role))
         except Exception as e:
             print(f"⚠️ Không thể cấp role {target_role.name} cho {member}: {e}")
+            if notify_channel:
+                await notify_channel.send(f"⚠️ Lỗi khi cấp role {target_role.mention}: `{e}`")
 
     if upgraded_tiers:
         embed = discord.Embed(
@@ -1914,6 +2161,21 @@ async def process_add_spent(channel: discord.TextChannel, staff: discord.Member,
     if upgraded:
         new_roles_str = ", ".join([r.mention for _, r in upgraded])
         upgraded_text = f"\n\n🎉 **THĂNG HẠNG VIP MỚI:** Khách hàng đạt mốc và đã nhận {new_roles_str}!"
+    else:
+        # Hiển thị vai trò VIP hiện tại của khách nếu đã có từ trước
+        with get_db() as conn:
+            all_tiers = conn.execute(
+                "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+                (channel.guild.id,),
+            ).fetchall()
+        cur_tier = None
+        for t in all_tiers:
+            if total_spent >= t["required_spent"]:
+                cur_tier = t
+        if cur_tier:
+            c_role = channel.guild.get_role(cur_tier["role_id"])
+            c_disp = c_role.mention if c_role else f"`{cur_tier['tier_name']}`"
+            upgraded_text = f"\n\n👑 **Hạng VIP hiện tại:** {c_disp}"
 
     embed = discord.Embed(
         title=f"✅ ĐÃ CỘNG CHI TIÊU CHO KHÁCH HÀNG #{order_id}",
@@ -2212,26 +2474,42 @@ async def on_message(message: discord.Message):
     # Dành cho Quản trị viên / Nhân viên Store (manage_messages hoặc administrator)
     if message.author.guild_permissions.manage_messages or message.author.guild_permissions.administrator:
         m_plus = re.match(
-            r"^(?:>)?\+\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+(?:to\s+)?<@!?(\d+)>(.*)",
+            r"^(?:>)?\+\s*([0-9\.,_]+[kKmMtrTRbB]?)\s*(?:to\s+)?(?:<@!?(\d+)>|(\d{15,21}))(.*)",
             content_raw,
+            re.IGNORECASE,
         )
-        if m_plus and message.mentions:
+        if m_plus:
             amt_str = m_plus.group(1)
-            target_mem = message.mentions[0]
-            extra_item = m_plus.group(3).strip() or "Cộng chi tiêu nhanh"
-            try:
-                amt = parse_smart_amount(amt_str)
-                if amt > 0:
-                    await process_add_spent(
-                        message.channel,
-                        message.author,
-                        target_mem,
-                        amt,
-                        item_name=extra_item,
-                    )
-                    return
-            except Exception:
-                pass
+            uid_str = m_plus.group(2) or m_plus.group(3)
+            extra_item = (m_plus.group(4) or "").strip() or "Cộng chi tiêu nhanh"
+            target_mem = None
+            if uid_str:
+                target_mem = message.guild.get_member(int(uid_str))
+                if not target_mem:
+                    try:
+                        target_mem = await message.guild.fetch_member(int(uid_str))
+                    except Exception:
+                        target_mem = None
+            if not target_mem and message.mentions:
+                target_mem = message.mentions[0]
+
+            if target_mem and not isinstance(target_mem, discord.Member):
+                target_mem = message.guild.get_member(target_mem.id)
+
+            if target_mem:
+                try:
+                    amt = parse_smart_amount(amt_str)
+                    if amt > 0:
+                        await process_add_spent(
+                            message.channel,
+                            message.author,
+                            target_mem,
+                            amt,
+                            item_name=extra_item,
+                        )
+                        return
+                except Exception as e:
+                    print(f"⚠️ Lỗi cú pháp cộng tiền nhanh: {e}")
 
     # 3. TÍNH TOÁN THÔNG MINH KHÔNG CẦN LỆNH (AUTO INLINE CALCULATOR)
     if not content_raw.startswith(">"):
@@ -2329,7 +2607,45 @@ async def cmd_qr(ctx: commands.Context, amount_str: str = "0", *, content: str =
             "❌ Định dạng số tiền không hợp lệ! Ví dụ đúng: `>qr 50k Mua Nitro` hoặc `>qr 1.5m`"
         )
 
-    transfer_note = content.strip() or f"THANH TOAN {ctx.author.name.upper()}"
+    # 1. Xác định mã thanh toán duy nhất cho kênh hiện tại
+    channel_code = None
+    if ctx.channel.topic:
+        m_t = re.search(r"TICKET\s*(\d+)", ctx.channel.topic.upper())
+        if m_t:
+            channel_code = f"TICKET{m_t.group(1)}"
+    if not channel_code:
+        m_n = re.search(r"ticket-[^-]+-(\d+)", ctx.channel.name.lower())
+        if m_n:
+            channel_code = f"TICKET{m_n.group(1)}"
+
+    # Nếu không phải ticket hoặc chưa có mã, sinh mã HDxxxx ngẫu nhiên
+    if not channel_code:
+        channel_code = f"HD{random.randint(1000, 9999)}"
+
+    # 2. Xây dựng nội dung chuyển khoản: luôn có mã channel_code ở đầu
+    user_tag = re.sub(r"[^A-Za-z0-9]", "", ctx.author.name.upper())[:10]
+    extra_content = content.strip().upper()
+    if extra_content:
+        if channel_code in extra_content:
+            transfer_note = extra_content
+        else:
+            transfer_note = f"{channel_code} {extra_content}"
+    else:
+        transfer_note = f"{channel_code} {user_tag}"
+
+    # Chuẩn VietQR giới hạn addInfo tối đa 50 ký tự
+    transfer_note = transfer_note[:50].strip()
+
+    # 3. Đăng ký vào pending_payments để Webhook nhận diện đúng 100% kênh này
+    register_pending_payment(
+        code=channel_code,
+        guild_id=ctx.guild.id,
+        channel_id=ctx.channel.id,
+        user_id=ctx.author.id,
+        amount=amount,
+        note=transfer_note,
+    )
+
     qr_url = build_vietqr_url(
         settings["bank_code"], settings["account_no"], settings["account_name"], amount, transfer_note
     )
@@ -2340,15 +2656,17 @@ async def cmd_qr(ctx: commands.Context, amount_str: str = "0", *, content: str =
             f"┃ ➡️ **Ngân hàng:** `{settings['bank_code']}`\n"
             f"┃ ➡️ **Số tài khoản:** `{settings['account_no']}`\n"
             f"┃ ➡️ **Chủ tài khoản:** `{settings['account_name']}`\n"
-            f"┃ ➡️ **Số tiền:** ✨ **`{format_vnd(amount)}`**\n\n"
-            f"📋 **Nội dung chuyển khoản (Tự động điền khi quét QR):**\n"
-            f"```text\n{transfer_note}\n```"
+            f"┃ ➡️ **Số tiền:** ✨ **`{format_vnd(amount)}`**\n"
+            f"┃ ➡️ **Kênh nhận thông báo:** {ctx.channel.mention}\n\n"
+            f"📋 **Nội dung chuyển khoản (Đã tích hợp mã nhận diện tự động):**\n"
+            f"```text\n{transfer_note}\n```\n"
+            f"⚡ *Quét mã bằng App Ngân hàng / MoMo để hệ thống tự động xác nhận bill ngay tại kênh này!*"
         ),
         color=COLOR_CYAN,
         timestamp=datetime.now(VN_TZ),
     )
     embed.set_image(url=qr_url)
-    embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name} • Quét bằng mọi App Ngân hàng & MoMo")
+    embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name} • Mã giao dịch: {channel_code}")
     await ctx.reply(embed=embed)
 
 
@@ -2453,6 +2771,15 @@ async def cmd_createticket(ctx: commands.Context, category_name: str = None, *, 
         name=f"ticket-{clean_username}-{ticket_num}",
         overwrites=overwrites,
         topic=f"Ticket của {user.display_name} ({user.id}) | Mã: TICKET{ticket_num}",
+    )
+
+    register_pending_payment(
+        code=f"TICKET{ticket_num}",
+        guild_id=guild.id,
+        channel_id=ticket_channel.id,
+        user_id=user.id,
+        amount=0,
+        note=f"Ticket {category_name}",
     )
 
     embed = discord.Embed(
@@ -3271,20 +3598,61 @@ async def cmd_done(ctx: commands.Context, customer: discord.Member, amount_str: 
 
 @bot.command(name="addspent", aliases=["congchitieu", "themtienchi"])
 @commands.has_permissions(manage_messages=True)
-async def cmd_addspent(ctx: commands.Context, customer: discord.Member, amount_str: str, *, item: str = "Cộng chi tiêu"):
+async def cmd_addspent(ctx: commands.Context, arg1: str = None, arg2: str = None, *, item: str = "Cộng chi tiêu"):
     """
     Cộng tiền chi tiêu cho khách hàng để thăng hạng VIP.
-    Cú pháp: >addspent @khách <tiền> [mặt_hàng]
-    Ví dụ: >addspent @player 100k
+    Cú pháp linh hoạt:
+      >addspent @khách 100k [mặt hàng]
+      >addspent 100k @khách [mặt hàng]
     """
+    if not arg1 or not arg2:
+        return await ctx.reply("❌ Cú pháp đúng: `>addspent @khách <số tiền>` hoặc `>+<số tiền> to @khách`\nVí dụ: `>addspent @player 100k`")
+
+    target_mem = None
+    amt_str = None
+
+    if ctx.message.mentions:
+        target_mem = ctx.message.mentions[0]
+        if str(target_mem.id) in arg1:
+            amt_str = arg2
+        else:
+            amt_str = arg1
+    else:
+        # Kiểm tra nếu arg1 hoặc arg2 là User ID
+        m_id1 = re.search(r"(\d{15,21})", arg1)
+        m_id2 = re.search(r"(\d{15,21})", arg2)
+        if m_id1:
+            target_mem = ctx.guild.get_member(int(m_id1.group(1)))
+            amt_str = arg2
+        elif m_id2:
+            target_mem = ctx.guild.get_member(int(m_id2.group(1)))
+            amt_str = arg1
+        else:
+            # Thử tìm theo tên
+            mem = discord.utils.find(lambda m: m.name.lower() == arg1.lower() or m.display_name.lower() == arg1.lower(), ctx.guild.members)
+            if mem:
+                target_mem = mem
+                amt_str = arg2
+            else:
+                mem = discord.utils.find(lambda m: m.name.lower() == arg2.lower() or m.display_name.lower() == arg2.lower(), ctx.guild.members)
+                if mem:
+                    target_mem = mem
+                    amt_str = arg1
+
+    if not target_mem:
+        return await ctx.reply("❌ Không tìm thấy thành viên cần cộng chi tiêu! Hãy tag @khách hoặc nhập ID.")
+
+    if not isinstance(target_mem, discord.Member):
+        target_mem = ctx.guild.get_member(target_mem.id)
+
     try:
-        amt = parse_smart_amount(amount_str)
+        amt = parse_smart_amount(amt_str)
         if amt <= 0:
             raise ValueError()
     except Exception:
-        return await ctx.reply("❌ Định dạng số tiền không hợp lệ! Ví dụ: `50k`, `100k`, `200k`...")
+        return await ctx.reply(f"❌ Định dạng số tiền `{amt_str}` không hợp lệ! Ví dụ: `50k`, `100k`, `200k`...")
 
-    await process_add_spent(ctx.channel, ctx.author, customer, amt, item_name=item)
+    await process_add_spent(ctx.channel, ctx.author, target_mem, amt, item_name=item)
 
 
 @bot.command(name="doanhthu")
@@ -5705,7 +6073,7 @@ async def handle_bank_webhook(request: web.Request):
     if isinstance(data, dict):
         if "transferAmount" in data or "amount" in data:
             raw_amt = data.get("transferAmount") if "transferAmount" in data else data.get("amount")
-            raw_content = data.get("content") or data.get("description") or ""
+            raw_content = f"{data.get('content', '')} {data.get('description', '')}".strip()
             try:
                 amt = int(float(raw_amt or 0))
             except Exception:
@@ -5714,7 +6082,7 @@ async def handle_bank_webhook(request: web.Request):
         elif isinstance(data.get("data"), list):
             for item in data["data"]:
                 raw_amt = item.get("amount") or item.get("transferAmount") or 0
-                raw_content = item.get("description") or item.get("content") or ""
+                raw_content = f"{item.get('content', '')} {item.get('description', '')}".strip()
                 try:
                     amt = int(float(raw_amt or 0))
                 except Exception:
@@ -5723,7 +6091,7 @@ async def handle_bank_webhook(request: web.Request):
     elif isinstance(data, list):
         for item in data:
             raw_amt = item.get("amount") or item.get("transferAmount") or 0
-            raw_content = item.get("description") or item.get("content") or ""
+            raw_content = f"{item.get('content', '')} {item.get('description', '')}".strip()
             try:
                 amt = int(float(raw_amt or 0))
             except Exception:
@@ -5742,43 +6110,61 @@ async def handle_bank_webhook(request: web.Request):
 
         print(f"💰 [BANK WEBHOOK] Đang xử lý giao dịch: +{format_vnd(amt)} | Nội dung: '{desc}'")
 
-        # Tìm mã TICKETxxxx (4-8 chữ số) trong nội dung chuyển khoản
-        m = re.search(r"TICKET\s*(\d+)", desc.upper())
-        target_code = m.group(1) if m else None
+        target_channel, customer_user_id, matched_code = await resolve_payment_channel_and_user(desc)
 
-        sent_to_ticket = False
-        for guild in bot.guilds:
-            for ch in guild.text_channels:
-                if target_code:
-                    matched = (
-                        ch.name.endswith(f"-{target_code}")
-                        or f"ticket{target_code}" in ch.name.lower()
-                        or (ch.topic and f"TICKET{target_code}" in ch.topic.upper())
+        if target_channel:
+            customer_member = target_channel.guild.get_member(customer_user_id) if customer_user_id else None
+            mention_str = customer_member.mention if customer_member else "@here"
+
+            embed = discord.Embed(
+                title="✅ THANH TOÁN THÀNH CÔNG (AUTO CHECK BILL)",
+                description=(
+                    f"**✅ Đã nhận được {format_vnd(amt)}! Giao dịch đã được xác nhận tự động.**\n\n"
+                    f"```text\n"
+                    f"Số tiền nhận : {format_vnd(amt)}\n"
+                    f"Nội dung CK  : {desc}\n"
+                    f"Mã đơn hàng  : {matched_code or 'N/A'}\n"
+                    f"Thời gian    : {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m/%Y')}\n"
+                    f"```\n"
+                    f"👉 *Nhân viên hoặc hệ thống sẽ hỗ trợ bàn giao dịch vụ ngay cho bạn!*"
+                ),
+                color=COLOR_SUCCESS,
+                timestamp=datetime.now(VN_TZ),
+            )
+            try:
+                await target_channel.send(content=f"🔔 {mention_str} | **Đã nhận thanh toán tự động thành công!**", embed=embed)
+                print(f"✅ Đã gửi thông báo xác nhận bill vào kênh #{target_channel.name} ({target_channel.id})")
+            except Exception as e:
+                print(f"⚠️ Lỗi gửi tin nhắn vào #{target_channel.name}: {e}")
+
+            # Tự động cộng chi tiêu tích lũy VIP nếu xác định được khách hàng
+            if customer_member:
+                now_dt = datetime.now(VN_TZ)
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO sales_orders (guild_id, staff_id, customer_id, amount, item, created_at, day_str, month_str)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_channel.guild.id,
+                            bot.user.id,
+                            customer_member.id,
+                            amt,
+                            f"Auto VietQR ({matched_code})",
+                            now_dt.strftime("%H:%M %d/%m/%Y"),
+                            now_dt.strftime("%Y-%m-%d"),
+                            now_dt.strftime("%Y-%m"),
+                        ),
                     )
-                    if matched:
-                        embed = discord.Embed(
-                            title="✅ THANH TOÁN THÀNH CÔNG (AUTO CHECK BILL)",
-                            description=(
-                                f"**✅ Đã nhận được {format_vnd(amt)}! Nhân viên sẽ bàn giao ngay cho bạn.**\n\n"
-                                f"```text\n"
-                                f"Số tiền nhận : {format_vnd(amt)}\n"
-                                f"Nội dung CK  : {desc}\n"
-                                f"Thời gian    : {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m/%Y')}\n"
-                                f"```"
-                            ),
-                            color=COLOR_SUCCESS,
-                            timestamp=datetime.now(VN_TZ),
-                        )
-                        try:
-                            await ch.send(content="🔔 @here | **Đã nhận thanh toán tự động thành công!**", embed=embed)
-                            sent_to_ticket = True
-                            print(f"✅ Đã gửi thông báo xác nhận bill vào phòng #{ch.name}")
-                        except Exception as e:
-                            print(f"⚠️ Lỗi gửi tin nhắn vào #{ch.name}: {e}")
-
-            # Nếu không tìm thấy Ticket khớp mã (hoặc khách không ghi mã TICKETxxxx)
-            # Gửi thông báo về kênh ticket-logs hoặc kênh thông báo của Store để không bị sót bill!
-            if not sent_to_ticket:
+                    conn.commit()
+                try:
+                    await check_and_upgrade_vip_role(target_channel.guild, customer_member, notify_channel=target_channel)
+                except Exception as e:
+                    print(f"⚠️ Lỗi nâng cấp role VIP sau khi nhận bill: {e}")
+        else:
+            # Gửi thông báo về kênh ticket-logs hoặc kênh bill dự phòng để không bị sót đơn
+            for guild in bot.guilds:
                 settings = get_guild_settings(guild.id)
                 log_ch_id = settings.get("ticket_log_channel_id", 0)
                 log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
@@ -5790,9 +6176,9 @@ async def handle_bank_webhook(request: web.Request):
 
                 if log_ch:
                     fallback_embed = discord.Embed(
-                        title="💰 NHẬN TIỀN NGÂN HÀNG (CHƯA RÕ PHÒNG TICKET)",
+                        title="💰 NHẬN TIỀN NGÂN HÀNG (CHƯA RÕ KÊNH GIAO DỊCH)",
                         description=(
-                            f"Hệ thống vừa nhận được một khoản thanh toán nhưng **nội dung chuyển khoản không khớp với mã Ticket nào đang mở**!\n\n"
+                            f"Hệ thống vừa nhận được một khoản thanh toán nhưng **nội dung chuyển khoản không khớp với mã đơn/Ticket nào đang mở**!\n\n"
                             f"```text\n"
                             f"Số tiền nhận : {format_vnd(amt)}\n"
                             f"Nội dung CK  : {desc}\n"
