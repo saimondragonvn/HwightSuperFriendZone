@@ -136,9 +136,15 @@ Hoặc chạy lệnh trong terminal:
 | `>gend <message_id>` | Kết thúc sớm Giveaway đang diễn ra |
 | `>greroll <message_id>` | Quay lại người trúng thưởng mới cho Giveaway đã kết thúc |
 
-### 🪙 5. Hệ Thống Ví Xu & Mini-Game Giải Trí
+### 🪙 5. Hệ Thống Ví Xu, Cửa Hàng Đổi Thưởng & Bảng Xếp Hạng
 | Lệnh | Mô tả |
 | :--- | :--- |
+| `>top [xu/daigia/legit]` | Bảng Xếp Hạng Top Server Real-Time (Top Xu, Top Đại Gia chi tiêu, Top Uy Tín Legit) kèm 3 nút bấm tương tác |
+| `>shop` (hoặc `>cuahang`) | Mở Cửa Hàng Đổi Thưởng: Đổi Role VIP hoặc Key bản quyền tự động bằng Xu tích lũy kèm Select Menu mua nhanh |
+| `>buy <id>` (hoặc `>mua`) | Mua / đổi thưởng vật phẩm trong Shop bằng ID (VD: `>buy 1`) |
+| `>addshopitem <loại> <giá> <tên> [role/ngày] [kho]` | Thêm mặt hàng Role VIP / Key / Quà tặng vào Shop Đổi Thưởng (Chỉ Admin) |
+| `>delshopitem <id>` | Xóa mặt hàng khỏi Shop theo ID (Chỉ Admin) |
+| `>clearshop` | Xóa sạch toàn bộ mặt hàng trong Shop Đổi Thưởng (Chỉ Admin) |
 | `>daily` | Điểm danh mỗi ngày nhận ngẫu nhiên 10.000đ - 50.000đ Xu |
 | `>bal [@user]` | Kiểm tra số dư ví Xu của bạn hoặc người khác |
 | `>taixiu <tai/xiu> <tiền>` | Chơi mini-game Tài Xỉu 3 xúc xắc (VD: `>taixiu tai 10k`) |
@@ -146,10 +152,32 @@ Hoặc chạy lệnh trong terminal:
 | `>pay @user <tiền>` | Chuyển Xu cho thành viên khác trong Server |
 | `>congtien @user <tiền>` | Cộng hoặc trừ Xu cho thành viên (Chỉ Admin) |
 
-### 👑 6. Hồ Sơ Khách Hàng VIP & Quản Trị Server
+### 🚀 6. Hệ Thống Cấp Độ, XP & Thông Báo Thăng Cấp (Ping Kênh)
 | Lệnh | Mô tả |
 | :--- | :--- |
-| `>profile [@user]` | Thẻ hồ sơ thành viên VIP: tổng tiền đã mua, số đơn hàng, hạng VIP và Xu |
+| `>rank [@user]` | Thẻ hồ sơ cấp độ, thanh tiến độ XP, thứ hạng hoạt động và tổng tin nhắn |
+| `>toplevel` | Bảng Xếp Hạng Top 10 thành viên hoạt động nhiều nhất Server theo Level |
+| `>setlevelupchannel <#kênh/none>` | **Cài đặt kênh thông báo & PING thành viên khi thăng cấp** (Chỉ Admin) |
+| `>addlevelrole <level> [tên hoặc @Role]` | Gán Role thưởng khi lên cấp (Hỗ trợ **Tự Động Tạo Role mới** trên Discord nếu chưa có) (Chỉ Admin) |
+| `>dellevelrole <level>` | Xóa Role phần thưởng của mốc cấp độ (Chỉ Admin) |
+| `>levelroles` | Xem danh sách toàn bộ Role thưởng theo Level của Server |
+
+### 💎 7. Hệ Thống Mốc Chi Tiêu & Nâng Cấp Role VIP Tự Động (Tự Tạo Role & Mốc 50k, 100k)
+| Lệnh | Mô tả |
+| :--- | :--- |
+| `>+<tiền> to @user` (hoặc `+<tiền> @user`) | ⚡ **Cú pháp nhanh:** Cộng tiền chi tiêu và **tự động phân biệt & gán đúng Role VIP** (VD: `>+100k to @player`) |
+| `>addspent @user <tiền> [món]` | Lệnh cộng chi tiêu tích lũy cho khách hàng (Staff/Admin) |
+| `>setupviproles` (hoặc `>taorolevip`) | ⚡ **1-Click Tự Động Tạo Trọn Bộ Role VIP** trên Discord (50k, 100k, 200k, 500k, 1M, 2M, 5M) kèm màu sắc & hoist chuẩn |
+| `>setviptier <tiền> [tên_role hoặc @Role]` | Thiết lập mốc chi tiêu VIP (**Tự động tạo Role mới** nếu chỉ nhập số tiền / tên, VD: `>setviptier 50k` hoặc `>setviptier 100k`) |
+| `>viptiers` | Xem bảng các mốc tiền chi tiêu yêu cầu và Role VIP được nhận |
+| `>delviptier <id>` | Xóa mốc chi tiêu VIP theo ID (Chỉ Admin) |
+| `>spent [@user]` | Xem tổng tiền đã mua hàng tại Store, số đơn đã chốt và tiến độ lên mốc VIP kế tiếp |
+| `>syncvip [@user/all]` | Quét lại cơ sở dữ liệu và tự động trao bổ sung Role VIP cho người đủ mốc (Chỉ Admin) |
+
+### 👑 8. Hồ Sơ Khách Hàng VIP & Quản Trị Server
+| Lệnh | Mô tả |
+| :--- | :--- |
+| `>profile [@user]` | Thẻ hồ sơ thành viên VIP: tổng tiền đã chi, tiến độ mốc VIP, số đơn hàng và Xu |
 | `>serverinfo` | Xem tổng quan thông tin, cấp độ Boost và trạng thái Server |
 | `>announce <#kênh> <nội dung>` | Đăng thông báo Store chính thức vào kênh chỉ định |
 | `>genkey @Role <ngày> [số lượng]` | Tạo Key VIP cấp Role có thời hạn (0 = vĩnh viễn) |

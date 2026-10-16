@@ -69,6 +69,9 @@ COLOR_PRIMARY = 0x5865F2    # Xanh Blurple Discord
 # =============================================================================
 def get_db():
     """Tạo kết nối tới SQLite database với row_factory dạng dict."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -106,6 +109,8 @@ def init_db():
             c.execute("ALTER TABLE store_settings ADD COLUMN store_name TEXT DEFAULT 'Cookie Store'")
         if "store_author" not in cols:
             c.execute("ALTER TABLE store_settings ADD COLUMN store_author TEXT DEFAULT 'made by ngocngann'")
+        if "levelup_channel_id" not in cols:
+            c.execute("ALTER TABLE store_settings ADD COLUMN levelup_channel_id INTEGER DEFAULT 0")
         # 2. Bảng lưu trữ dữ liệu bảo mật (>paste / >taoban)
         c.execute("""
             CREATE TABLE IF NOT EXISTS secret_pastes (
@@ -247,6 +252,78 @@ def init_db():
                 balance INTEGER DEFAULT 0,
                 last_daily TEXT DEFAULT '',
                 PRIMARY KEY (user_id, guild_id)
+            )
+        """)
+        # 13. Bảng Cửa Hàng Đổi Thưởng Bằng Xu (>shop, >buy)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shop_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                item_name TEXT,
+                item_type TEXT,
+                price_coins INTEGER,
+                role_id INTEGER DEFAULT 0,
+                key_days INTEGER DEFAULT 0,
+                stock INTEGER DEFAULT -1,
+                description TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shop_purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                user_id INTEGER,
+                item_id INTEGER,
+                item_name TEXT,
+                price_coins INTEGER,
+                purchased_at TEXT
+            )
+        """)
+        # 14. Bảng store_revenues đồng bộ cho profile và sales
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS store_revenues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                staff_id INTEGER,
+                customer_id INTEGER,
+                amount INTEGER,
+                note TEXT,
+                timestamp TEXT,
+                day_str TEXT,
+                month_str TEXT
+            )
+        """)
+        # 15. Bảng mốc chi tiêu nâng cấp Role VIP (>setviptier, >viptiers)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS vip_tiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                tier_name TEXT,
+                required_spent INTEGER,
+                role_id INTEGER,
+                created_at TEXT
+            )
+        """)
+        # 16. Bảng cấp độ & tương tác thành viên (>rank, >toplevel)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_levels (
+                user_id INTEGER,
+                guild_id INTEGER,
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                messages_count INTEGER DEFAULT 0,
+                last_xp_time REAL DEFAULT 0,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        """)
+        # 17. Bảng phần thưởng Role theo Level (>addlevelrole, >levelroles)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS level_roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                level_req INTEGER,
+                role_id INTEGER,
+                UNIQUE (guild_id, level_req)
             )
         """)
         conn.commit()
@@ -1701,6 +1778,282 @@ def update_user_balance(guild_id: int, user_id: int, delta: int):
         conn.commit()
 
 
+# --- 8. TIỆN ÍCH TÍNH TỔNG CHI TIÊU & TỰ ĐỘNG THĂNG HẠNG ROLE VIP ---
+def get_user_total_spent(guild_id: int, user_id: int) -> tuple[int, int]:
+    """Tính tổng số tiền đã chi tiêu và tổng số đơn hàng đã mua của người dùng trong Server."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) as s, COUNT(*) as c FROM (
+                SELECT amount, customer_id, guild_id FROM sales_orders
+                UNION ALL
+                SELECT amount, customer_id, guild_id FROM store_revenues
+            ) WHERE guild_id = ? AND customer_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+        if row:
+            return row["s"], row["c"]
+        return 0, 0
+
+
+def make_spending_progress_bar(current: int, target: int, length: int = 10) -> str:
+    """Tạo thanh tiến độ chi tiêu trực quan đẹp mắt [██████░░░░] 60%."""
+    if target <= 0:
+        return f"[`{'█' * length}`] **100%**"
+    ratio = min(1.0, max(0.0, current / target))
+    filled = int(ratio * length)
+    bar = "█" * filled + "░" * (length - filled)
+    percent = int(ratio * 100)
+    return f"[`{bar}`] **{percent}%**"
+
+
+async def check_and_upgrade_vip_role(guild: discord.Guild, member: discord.Member, notify_channel: discord.TextChannel = None) -> list:
+    """
+    Tự động kiểm tra tổng chi tiêu của khách hàng.
+    Phân biệt chính xác từng mốc VIP: Tự động trao Role mốc cao nhất đạt được,
+    và thu hồi các Role VIP mốc thấp hơn để thành viên có đúng 1 danh hiệu VIP tương xứng!
+    """
+    total_spent, _ = get_user_total_spent(guild.id, member.id)
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (guild.id,),
+        ).fetchall()
+
+    if not tiers:
+        return []
+
+    # Tìm mốc VIP cao nhất mà khách hàng đạt được
+    highest_tier = None
+    for tier in tiers:
+        role = guild.get_role(tier["role_id"])
+        if role and total_spent >= tier["required_spent"]:
+            highest_tier = (tier, role)
+
+    if not highest_tier:
+        return []
+
+    target_tier, target_role = highest_tier
+
+    # Thu hồi các role VIP mốc thấp hơn nếu khách đang giữ để tránh trùng lặp
+    for tier in tiers:
+        if tier["required_spent"] < target_tier["required_spent"]:
+            r = guild.get_role(tier["role_id"])
+            if r and r in member.roles and r.id != target_role.id:
+                try:
+                    await member.remove_roles(r, reason="Nâng cấp lên hạng VIP cao hơn")
+                except Exception:
+                    pass
+
+    # Trao role mốc cao nhất nếu chưa có
+    upgraded_tiers = []
+    if target_role not in member.roles:
+        try:
+            await member.add_roles(target_role, reason=f"Đạt mốc chi tiêu VIP Store: {format_vnd(target_tier['required_spent'])}")
+            upgraded_tiers.append((target_tier, target_role))
+        except Exception as e:
+            print(f"⚠️ Không thể cấp role {target_role.name} cho {member}: {e}")
+
+    if upgraded_tiers:
+        embed = discord.Embed(
+            title="👑 CHÚC MỪNG THĂNG HẠNG THÀNH VIÊN VIP! 👑",
+            description=(
+                f"🎉 Chúc mừng quý khách {member.mention} đã chính thức được thăng hạng đặc quyền!\n\n"
+                f"┃ ➡️ **Hạng VIP mới:** **{target_tier['tier_name']}** ({target_role.mention})\n"
+                f"┃ ➡️ **Mốc yêu cầu:** 💎 **`{format_vnd(target_tier['required_spent'])}`**\n"
+                f"┃ ➡️ **Tổng tiền đã chi tiêu:** 💎 **`{format_vnd(total_spent)}`**\n\n"
+                f"✨ *Cảm ơn bạn đã luôn tin tưởng và đồng hành cùng {guild.name}!*"
+            ),
+            color=COLOR_GOLD,
+            timestamp=datetime.now(VN_TZ),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="Hệ Thống Thăng Hạng VIP Tự Động • Phân Biệt Mốc Thông Minh")
+
+        # Gửi thông báo vào kênh chat / ticket
+        if notify_channel:
+            try:
+                await notify_channel.send(content=f"🔔 {member.mention} | Bạn đã được thăng hạng VIP mới!", embed=embed)
+            except Exception:
+                pass
+
+        # Gửi tin nhắn riêng (DM) chúc mừng khách
+        try:
+            await member.send(embed=embed)
+        except Exception:
+            pass
+
+    return upgraded_tiers
+
+
+async def process_add_spent(channel: discord.TextChannel, staff: discord.Member, customer: discord.Member, amount: int, item_name: str = "Cộng chi tiêu"):
+    """Xử lý cộng chi tiêu tích lũy cho khách hàng và tự động phân biệt gán Role VIP."""
+    now_dt = datetime.now(VN_TZ)
+    now_str = now_dt.strftime("%H:%M %d/%m/%Y")
+    day_str = now_dt.strftime("%Y-%m-%d")
+    month_str = now_dt.strftime("%Y-%m")
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO sales_orders (guild_id, staff_id, customer_id, amount, item, created_at, day_str, month_str)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (channel.guild.id, staff.id, customer.id, amount, item_name, now_str, day_str, month_str),
+        )
+        order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+
+    total_spent, orders_count = get_user_total_spent(channel.guild.id, customer.id)
+
+    # Tự động kiểm tra và phân biệt mốc để gán Role VIP
+    upgraded = await check_and_upgrade_vip_role(channel.guild, customer, notify_channel=channel)
+
+    upgraded_text = ""
+    if upgraded:
+        new_roles_str = ", ".join([r.mention for _, r in upgraded])
+        upgraded_text = f"\n\n🎉 **THĂNG HẠNG VIP MỚI:** Khách hàng đạt mốc và đã nhận {new_roles_str}!"
+
+    embed = discord.Embed(
+        title=f"✅ ĐÃ CỘNG CHI TIÊU CHO KHÁCH HÀNG #{order_id}",
+        description=(
+            f"┃ ➡️ **Khách hàng:** {customer.mention}\n"
+            f"┃ ➡️ **Người thực hiện:** {staff.mention}\n"
+            f"┃ ➡️ **Số tiền vừa cộng:** 💎 **`+{format_vnd(amount)}`**\n"
+            f"┃ ➡️ **Tổng tích lũy hiện tại:** 💰 **`{format_vnd(total_spent)}`** ({orders_count} đơn)"
+            f"{upgraded_text}"
+        ),
+        color=COLOR_SUCCESS,
+        timestamp=now_dt,
+    )
+    await channel.send(embed=embed)
+
+
+# --- 9. HỆ THỐNG CẤP ĐỘ, XP & THÔNG BÁO THĂNG CẤP (PING VÀO KÊNH) ---
+def xp_needed_for_level(level: int) -> int:
+    """Tính lượng XP cần thiết để thăng cấp từ `level` lên `level + 1`."""
+    return 5 * (level ** 2) + 50 * level + 100
+
+
+async def handle_user_activity_xp(message: discord.Message):
+    """
+    Tự động tính điểm XP tương tác khi thành viên chat trong server.
+    Nếu đủ điểm thăng cấp, bot sẽ ping người dùng vào kênh thông báo được chỉ định!
+    """
+    if message.author.bot or not message.guild:
+        return
+    if message.content.strip().startswith(">"):
+        return
+
+    now_ts = time.time()
+    user_id = message.author.id
+    guild_id = message.guild.id
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_levels WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        ).fetchone()
+
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_levels (user_id, guild_id, xp, level, messages_count, last_xp_time)
+                VALUES (?, ?, 0, 1, 1, ?)
+                """,
+                (user_id, guild_id, now_ts),
+            )
+            conn.commit()
+            return
+
+        last_xp = row["last_xp_time"] or 0
+        current_xp = row["xp"]
+        current_level = row["level"]
+        msg_count = (row["messages_count"] or 0) + 1
+
+        # Cooldown nhận XP: 45 giây một lần để chống spam
+        if (now_ts - last_xp) < 45.0:
+            conn.execute(
+                "UPDATE user_levels SET messages_count = ? WHERE user_id = ? AND guild_id = ?",
+                (msg_count, user_id, guild_id),
+            )
+            conn.commit()
+            return
+
+        xp_gain = random.randint(15, 25)
+        new_xp = current_xp + xp_gain
+        new_level = current_level
+        leveled_up = False
+
+        while True:
+            needed = xp_needed_for_level(new_level)
+            if new_xp >= needed:
+                new_xp -= needed
+                new_level += 1
+                leveled_up = True
+            else:
+                break
+
+        conn.execute(
+            """
+            UPDATE user_levels
+            SET xp = ?, level = ?, messages_count = ?, last_xp_time = ?
+            WHERE user_id = ? AND guild_id = ?
+            """,
+            (new_xp, new_level, msg_count, now_ts, user_id, guild_id),
+        )
+        conn.commit()
+
+    if leveled_up:
+        # Kiểm tra Role thưởng theo Level
+        role_reward = None
+        with get_db() as conn:
+            role_row = conn.execute(
+                "SELECT role_id FROM level_roles WHERE guild_id = ? AND level_req = ?",
+                (guild_id, new_level),
+            ).fetchone()
+            if role_row:
+                role_reward = message.guild.get_role(role_row["role_id"])
+                if role_reward and role_reward not in message.author.roles:
+                    try:
+                        await message.author.add_roles(role_reward, reason=f"Đạt mốc cấp độ Level {new_level}")
+                    except Exception as e:
+                        print(f"⚠️ Lỗi cấp role level {role_reward.name}: {e}")
+
+        # Lấy kênh thông báo thăng cấp (nếu có cấu hình)
+        settings = get_guild_settings(guild_id)
+        levelup_ch_id = settings.get("levelup_channel_id", 0)
+        target_channel = message.guild.get_channel(levelup_ch_id) if levelup_ch_id else message.channel
+
+        if not target_channel:
+            target_channel = message.channel
+
+        embed = discord.Embed(
+            title="🎉 CHÚC MỪNG THĂNG CẤP THÀNH VIÊN! 🎉",
+            description=(
+                f"🎉 {message.author.mention} vừa được thăng cấp danh vọng nhờ hoạt động tích cực!\n\n"
+                f"┃ ➡️ **Cấp độ mới:** 🚀 **Level {new_level}**\n"
+                f"┃ ➡️ **Tổng tin nhắn:** 💬 `{msg_count:,}` tin\n"
+                f"{f'┃ ➡️ **Role thưởng mở khóa:** 👑 {role_reward.mention}\n' if role_reward else ''}"
+                f"┃ ➡️ **Mục tiêu tiếp theo:** `{xp_needed_for_level(new_level)} XP`\n\n"
+                f"✨ *Hãy tiếp tục trò chuyện & tương tác để mở khóa các mốc Level cao hơn!*"
+            ),
+            color=COLOR_CYAN,
+            timestamp=datetime.now(VN_TZ),
+        )
+        embed.set_thumbnail(url=message.author.display_avatar.url)
+        embed.set_footer(text=f"Hệ Thống Level & Tương Tác • {message.guild.name}")
+
+        try:
+            await target_channel.send(
+                content=f"🔔 {message.author.mention} | Chúc mừng bạn đã thăng cấp **Level {new_level}**!",
+                embed=embed,
+            )
+        except Exception:
+            pass
+
+
 # =============================================================================
 # V. SỰ KIỆN BOT, AUTO INLINE CALCULATOR, ANTI-SPAM & AUTO LEGIT REACTION
 # =============================================================================
@@ -1855,15 +2208,30 @@ async def on_message(message: discord.Message):
                     pass
                 await send_or_bump_legit_panel(message.guild, legit_ch)
 
-    # 2.1 TỰ ĐỘNG GHIM LẠI MENU LEGIT XUỐNG DƯỚI CÙNG NẾU CÓ CHAT TRONG KÊNH FEEDBACK/LEGIT
-    settings_legit = get_guild_settings(message.guild.id)
-    if (
-        settings_legit
-        and settings_legit.get("legit_channel_id") == message.channel.id
-        and not content_raw.startswith(">")
-        and not is_legit_msg
-    ):
-        await send_or_bump_legit_panel(message.guild, message.channel)
+    # 2.2 TỰ ĐỘNG BẮT CÚ PHÁP CỘNG CHI TIÊU NHANH (VD: >+100k to @player, >+100k @player, +100k to @player)
+    # Dành cho Quản trị viên / Nhân viên Store (manage_messages hoặc administrator)
+    if message.author.guild_permissions.manage_messages or message.author.guild_permissions.administrator:
+        m_plus = re.match(
+            r"^(?:>)?\+\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+(?:to\s+)?<@!?(\d+)>(.*)",
+            content_raw,
+        )
+        if m_plus and message.mentions:
+            amt_str = m_plus.group(1)
+            target_mem = message.mentions[0]
+            extra_item = m_plus.group(3).strip() or "Cộng chi tiêu nhanh"
+            try:
+                amt = parse_smart_amount(amt_str)
+                if amt > 0:
+                    await process_add_spent(
+                        message.channel,
+                        message.author,
+                        target_mem,
+                        amt,
+                        item_name=extra_item,
+                    )
+                    return
+            except Exception:
+                pass
 
     # 3. TÍNH TOÁN THÔNG MINH KHÔNG CẦN LỆNH (AUTO INLINE CALCULATOR)
     if not content_raw.startswith(">"):
@@ -1889,6 +2257,9 @@ async def on_message(message: discord.Message):
                 )
                 await message.reply(embed=embed, mention_author=False)
                 return
+
+        # 4. TÍNH ĐIỂM XP TƯƠNG TÁC & TỰ ĐỘNG THĂNG CẤP (PING VÀO KÊNH)
+        await handle_user_activity_xp(message)
 
     await bot.process_commands(message)
 
@@ -2895,6 +3266,25 @@ async def cmd_done(ctx: commands.Context, customer: discord.Member, amount_str: 
         timestamp=now_dt,
     )
     await ctx.reply(embed=embed)
+    await check_and_upgrade_vip_role(ctx.guild, customer, notify_channel=ctx.channel)
+
+
+@bot.command(name="addspent", aliases=["congchitieu", "themtienchi"])
+@commands.has_permissions(manage_messages=True)
+async def cmd_addspent(ctx: commands.Context, customer: discord.Member, amount_str: str, *, item: str = "Cộng chi tiêu"):
+    """
+    Cộng tiền chi tiêu cho khách hàng để thăng hạng VIP.
+    Cú pháp: >addspent @khách <tiền> [mặt_hàng]
+    Ví dụ: >addspent @player 100k
+    """
+    try:
+        amt = parse_smart_amount(amount_str)
+        if amt <= 0:
+            raise ValueError()
+    except Exception:
+        return await ctx.reply("❌ Định dạng số tiền không hợp lệ! Ví dụ: `50k`, `100k`, `200k`...")
+
+    await process_add_spent(ctx.channel, ctx.author, customer, amt, item_name=item)
 
 
 @bot.command(name="doanhthu")
@@ -3469,6 +3859,7 @@ async def cmd_sellstock(ctx: commands.Context, target: str, customer: discord.Me
         timestamp=now,
     )
     await ctx.send(embed=embed)
+    await check_and_upgrade_vip_role(guild, customer, notify_channel=ctx.channel)
 
 
 @bot.command(name="importstock", aliases=["nhaphang"])
@@ -3878,37 +4269,555 @@ async def cmd_congtien(ctx: commands.Context, member: discord.Member, amount_str
     await ctx.reply(f"✅ Đã cộng/trừ **{format_vnd(amount)}** cho {member.mention}. Số dư mới: **`{format_vnd(new_bal)}`**")
 
 
+# =============================================================================
+# XI. BẢNG XẾP HẠNG TOP SERVER (>top) & CỬA HÀNG ĐỔI THƯỞNG BẰNG XU (>shop, >buy)
+# =============================================================================
+def render_leaderboard_embed(guild: discord.Guild, category: str = "coins") -> discord.Embed:
+    """Tạo Embed Bảng Xếp Hạng Top Server: Top Xu, Top Đại Gia (chi tiêu), Top Uy Tín (Legit)."""
+    category = category.lower()
+    with get_db() as conn:
+        if category in ("spent", "daigia", "chitieu"):
+            rows = conn.execute(
+                """
+                SELECT customer_id as user_id, SUM(amount) as val, COUNT(*) as extra
+                FROM (
+                    SELECT customer_id, amount, guild_id FROM sales_orders
+                    UNION ALL
+                    SELECT customer_id, amount, guild_id FROM store_revenues
+                )
+                WHERE guild_id = ?
+                GROUP BY customer_id
+                ORDER BY val DESC
+                LIMIT 10
+                """,
+                (guild.id,),
+            ).fetchall()
+            title = "💎 BẢNG XẾP HẠNG TOP ĐẠI GIA (CHI TIÊU STORE)"
+            color = COLOR_GOLD
+            unit_label = "Tổng chi"
+        elif category in ("legit", "uytin", "feedback"):
+            rows = conn.execute(
+                """
+                SELECT customer_id as user_id, COUNT(*) as val, 0 as extra
+                FROM legit_feedbacks
+                WHERE guild_id = ?
+                GROUP BY customer_id
+                ORDER BY val DESC
+                LIMIT 10
+                """,
+                (guild.id,),
+            ).fetchall()
+            title = "⭐ BẢNG XẾP HẠNG TOP UY TÍN (LEGIT / FEEDBACK)"
+            color = COLOR_SUCCESS
+            unit_label = "Lượt đánh giá"
+        else:
+            category = "coins"
+            rows = conn.execute(
+                """
+                SELECT user_id, balance as val, 0 as extra
+                FROM user_economy
+                WHERE guild_id = ? AND balance > 0
+                ORDER BY balance DESC
+                LIMIT 10
+                """,
+                (guild.id,),
+            ).fetchall()
+            title = "🪙 BẢNG XẾP HẠNG TOP TRIỆU PHÚ (VÍ XU STORE)"
+            color = COLOR_CYAN
+            unit_label = "Số dư ví"
+
+    embed = discord.Embed(
+        title=title,
+        description=f"Máy chủ: **{guild.name}** | Cập nhật Real-Time 24/7\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        color=color,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    if not rows:
+        embed.description += "\n\n*Chưa có dữ liệu xếp hạng trong danh mục này.*"
+    else:
+        rank_medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = []
+        for idx, r in enumerate(rows, start=1):
+            uid = r["user_id"]
+            val = r["val"]
+            extra = r["extra"]
+            medal = rank_medals.get(idx, f"`#{idx:02d}`")
+            member = guild.get_member(uid)
+            display_name = member.mention if member else f"`User ID: {uid}`"
+
+            if category in ("spent", "daigia", "chitieu"):
+                formatted_val = format_vnd(val)
+                lines.append(f"{medal} **{display_name}** • 💎 **`{formatted_val}`** *({extra} đơn)*")
+            elif category in ("legit", "uytin", "feedback"):
+                lines.append(f"{medal} **{display_name}** • ⭐ **`{val}`** *lượt Legit 5 sao*")
+            else:
+                formatted_val = format_vnd(val)
+                lines.append(f"{medal} **{display_name}** • 🪙 **`{formatted_val}`**")
+
+        embed.add_field(name="🏆 Thứ Hạng & Thành Tích", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="Bấm nút bên dưới để chuyển tab • HwightSuperFriendZone")
+    return embed
+
+
+class LeaderboardView(ui.View):
+    """View chuyển tab linh hoạt giữa Top Xu, Top Đại Gia và Top Uy Tín."""
+    def __init__(self, current_category: str = "coins"):
+        super().__init__(timeout=300)
+        self.category = current_category
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        for child in self.children:
+            if isinstance(child, ui.Button):
+                if child.custom_id == f"top_{self.category}":
+                    child.style = discord.ButtonStyle.primary
+                else:
+                    child.style = discord.ButtonStyle.secondary
+
+    @ui.button(label="🪙 Top Xu", custom_id="top_coins", style=discord.ButtonStyle.primary)
+    async def btn_coins(self, interaction: discord.Interaction, button: ui.Button):
+        self.category = "coins"
+        self._sync_buttons()
+        embed = render_leaderboard_embed(interaction.guild, "coins")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @ui.button(label="💎 Top Đại Gia", custom_id="top_spent", style=discord.ButtonStyle.secondary)
+    async def btn_spent(self, interaction: discord.Interaction, button: ui.Button):
+        self.category = "spent"
+        self._sync_buttons()
+        embed = render_leaderboard_embed(interaction.guild, "spent")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @ui.button(label="⭐ Top Uy Tín", custom_id="top_legit", style=discord.ButtonStyle.secondary)
+    async def btn_legit(self, interaction: discord.Interaction, button: ui.Button):
+        self.category = "legit"
+        self._sync_buttons()
+        embed = render_leaderboard_embed(interaction.guild, "legit")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@bot.command(name="top", aliases=["bxh", "leaderboard", "rankings"])
+async def cmd_top(ctx: commands.Context, category: str = "coins"):
+    """Xem Bảng Xếp Hạng Top Server: Top Xu, Top Đại Gia (chi tiêu), Top Uy Tín (Legit)."""
+    cat = category.lower()
+    if cat in ("spent", "daigia", "chitieu", "mua"):
+        active_cat = "spent"
+    elif cat in ("legit", "uytin", "feedback", "danhgia"):
+        active_cat = "legit"
+    else:
+        active_cat = "coins"
+
+    embed = render_leaderboard_embed(ctx.guild, active_cat)
+    view = LeaderboardView(current_category=active_cat)
+    await ctx.reply(embed=embed, view=view)
+
+
+def render_shop_embed(guild: discord.Guild, user: discord.Member):
+    """Tạo Embed danh sách mặt hàng có sẵn trong Cửa Hàng Đổi Thưởng."""
+    with get_db() as conn:
+        items = conn.execute(
+            "SELECT * FROM shop_items WHERE guild_id = ? ORDER BY price_coins ASC",
+            (guild.id,),
+        ).fetchall()
+
+    user_coins = get_user_balance(guild.id, user.id)
+    embed = discord.Embed(
+        title="🛒 CỬA HÀNG ĐỔI THƯỞNG BẰNG XU (REWARD SHOP)",
+        description=(
+            f"Chào mừng {user.mention} đến với **Reward Shop**!\n"
+            f"Bạn có thể dùng **Xu** cày từ mini-game (`>daily`, `>taixiu`, `>flip`) để đổi Role VIP hoặc Key bản quyền.\n\n"
+            f"💰 **Số dư Ví Xu của bạn:** 🪙 **`{format_vnd(user_coins)}`**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=COLOR_CYAN,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    if not items:
+        embed.add_field(
+            name="📦 Kho Hàng Trống",
+            value="*Hiện tại chưa có mặt hàng nào trong Shop. Quản trị viên hãy dùng lệnh `>addshopitem` để thêm!*",
+            inline=False,
+        )
+    else:
+        for it in items:
+            itype = it["item_type"]
+            if itype == "role":
+                type_tag = "👑 Cấp Role VIP"
+                extra_info = f"Role: <@&{it['role_id']}>"
+            elif itype == "key":
+                type_tag = f"🔑 Mã Key VIP ({it['key_days']} Ngày)"
+                extra_info = f"Role: <@&{it['role_id']}>"
+            else:
+                type_tag = "🎁 Quà Tặng / Vật Phẩm"
+                extra_info = it["description"] or "Liên hệ BQT nhận quà"
+
+            stock_val = it["stock"]
+            stock_tag = "♾️ Vô hạn" if stock_val == -1 else (f"⚠️ Hết hàng" if stock_val <= 0 else f"📦 Còn {stock_val} lượt")
+
+            embed.add_field(
+                name=f"📦 [ID: #{it['id']}] {it['item_name']} • 🪙 {format_vnd(it['price_coins'])}",
+                value=(
+                    f"┃ ➡️ **Loại:** {type_tag}\n"
+                    f"┃ ➡️ **Chi tiết:** {extra_info}\n"
+                    f"┃ ➡️ **Tồn kho:** {stock_tag}\n"
+                    f"┃ 👉 **Cú pháp mua:** `>buy {it['id']}` (hoặc chọn menu bên dưới)"
+                ),
+                inline=False,
+            )
+
+    embed.set_footer(text="HwightSuperFriendZone • Đổi thưởng an toàn & bảo mật 100%")
+    return embed, items
+
+
+async def process_shop_purchase(guild: discord.Guild, member: discord.Member, item_id: int):
+    """Hàm xử lý logic mua hàng trong Shop Xu."""
+    with get_db() as conn:
+        item = conn.execute(
+            "SELECT * FROM shop_items WHERE guild_id = ? AND id = ?",
+            (guild.id, item_id),
+        ).fetchone()
+
+    if not item:
+        return False, "❌ Không tìm thấy mặt hàng này trong Shop!"
+
+    price = item["price_coins"]
+    user_coins = get_user_balance(guild.id, member.id)
+    if user_coins < price:
+        return False, f"❌ Bạn không đủ Xu để đổi món này! (Cần: **`{format_vnd(price)}`**, hiện có: **`{format_vnd(user_coins)}`**)"
+
+    if item["stock"] == 0:
+        return False, "❌ Mặt hàng này đã tạm hết lượt đổi!"
+
+    reward_desc = ""
+    if item["item_type"] == "role":
+        role = guild.get_role(item["role_id"])
+        if not role:
+            return False, "❌ Role phần thưởng này không còn tồn tại trên server! Vui lòng báo Admin."
+        try:
+            await member.add_roles(role, reason=f"Đổi thưởng từ Shop Xu #{item_id}")
+            reward_desc = f"🎉 Đã tự động cấp Role {role.mention} cho bạn thành công!"
+        except discord.Forbidden:
+            return False, "❌ Bot không đủ quyền để cấp Role này (Role của bot cần nằm trên Role phần thưởng)!"
+        except Exception as e:
+            return False, f"❌ Gặp lỗi khi cấp Role: {e}"
+
+    elif item["item_type"] == "key":
+        role = guild.get_role(item["role_id"])
+        key_code = f"VIP-{item['key_days']}D-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO license_keys (key_code, guild_id, role_id, duration_days, is_used, used_by, used_at)
+                VALUES (?, ?, ?, ?, 0, 0, '')
+                """,
+                (key_code, guild.id, item["role_id"], item["key_days"]),
+            )
+            conn.commit()
+
+        # Thử gửi Key qua tin nhắn riêng (DM)
+        dm_sent = False
+        try:
+            dm_embed = discord.Embed(
+                title="🔑 MÃ KEY VIP TỪ SHOP XU",
+                description=(
+                    f"Cảm ơn bạn đã đổi thưởng tại máy chủ **{guild.name}**!\n\n"
+                    f"┃ ➡️ **Món đồ:** `{item['item_name']}`\n"
+                    f"┃ ➡️ **Role kích hoạt:** {role.mention if role else 'Role VIP'}\n"
+                    f"┃ ➡️ **Thời hạn:** `{item['key_days']}` ngày\n"
+                    f"┃ ➡️ **Mã Key VIP của bạn:**\n"
+                    f"```text\n{key_code}\n```\n"
+                    f"💡 *Nhập lệnh `>redeem {key_code}` trong server để kích hoạt nhận Role bất cứ lúc nào!*"
+                ),
+                color=COLOR_GOLD,
+                timestamp=datetime.now(VN_TZ),
+            )
+            await member.send(embed=dm_embed)
+            dm_sent = True
+        except Exception:
+            dm_sent = False
+
+        if dm_sent:
+            reward_desc = f"🎉 Đã tạo mã Key VIP và **gửi vào tin nhắn riêng (DM)** của bạn! Hãy kiểm tra DM nhé."
+        else:
+            reward_desc = f"🎉 Đã tạo mã Key VIP: **`{key_code}`** (Do bạn khóa DM nên bot gửi trực tiếp tại đây, hãy lưu lại nhé!)"
+
+    else:
+        reward_desc = f"🎉 Đã ghi nhận đơn đổi thưởng: **{item['item_name']}**! Vui lòng liên hệ Admin/Staff để nhận quà."
+
+    update_user_balance(guild.id, member.id, -price)
+    now_str = datetime.now(VN_TZ).strftime("%H:%M %d/%m/%Y")
+    with get_db() as conn:
+        if item["stock"] > 0:
+            conn.execute(
+                "UPDATE shop_items SET stock = stock - 1 WHERE id = ?",
+                (item["id"],),
+            )
+        conn.execute(
+            """
+            INSERT INTO shop_purchases (guild_id, user_id, item_id, item_name, price_coins, purchased_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (guild.id, member.id, item["id"], item["item_name"], price, now_str),
+        )
+        conn.commit()
+
+    rem_coins = get_user_balance(guild.id, member.id)
+    success_msg = (
+        f"✅ **ĐỔI THƯỞNG THÀNH CÔNG!**\n"
+        f"┃ ➡️ **Mặt hàng:** `{item['item_name']}`\n"
+        f"┃ ➡️ **Giá đổi:** 🪙 **`{format_vnd(price)}`**\n"
+        f"┃ ➡️ **Số dư Xu còn lại:** 🪙 **`{format_vnd(rem_coins)}`**\n"
+        f"┃ ➡️ **Kết quả:** {reward_desc}"
+    )
+    return True, success_msg
+
+
+class ShopItemSelect(ui.Select):
+    def __init__(self, items, user_id: int):
+        self.user_id = user_id
+        options = []
+        for it in items[:25]:
+            itype = it["item_type"]
+            emoji = "👑" if itype == "role" else ("🔑" if itype == "key" else "🎁")
+            stock_txt = "Hết" if it["stock"] == 0 else (f"{it['stock']} cái" if it["stock"] > 0 else "Vô hạn")
+            options.append(
+                discord.SelectOption(
+                    label=f"#{it['id']} - {it['item_name'][:45]}",
+                    value=str(it["id"]),
+                    description=f"{format_vnd(it['price_coins'])} • Kho: {stock_txt}",
+                    emoji=emoji,
+                )
+            )
+        super().__init__(placeholder="🛒 Chọn mặt hàng bạn muốn đổi bằng Xu...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("❌ Menu này được mở cho người dùng khác! Hãy gõ `>shop` để mở menu của riêng bạn.", ephemeral=True)
+
+        item_id = int(self.values[0])
+        success, msg = await process_shop_purchase(interaction.guild, interaction.user, item_id)
+        if success:
+            embed = discord.Embed(
+                title="🎁 GIAO DỊCH ĐỔI THƯỞNG THÀNH CÔNG",
+                description=msg,
+                color=COLOR_SUCCESS,
+                timestamp=datetime.now(VN_TZ),
+            )
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+class ShopView(ui.View):
+    def __init__(self, items, user_id: int):
+        super().__init__(timeout=180)
+        if items:
+            self.add_item(ShopItemSelect(items, user_id))
+
+
+@bot.command(name="shop", aliases=["cuahang", "doithuong", "shopxu"])
+async def cmd_shop(ctx: commands.Context):
+    """Mở Cửa Hàng Đổi Thưởng bằng Xu tích lũy."""
+    embed, items = render_shop_embed(ctx.guild, ctx.author)
+    view = ShopView(items, ctx.author.id) if items else None
+    await ctx.reply(embed=embed, view=view)
+
+
+@bot.command(name="buy", aliases=["mua", "doiqua"])
+async def cmd_buy(ctx: commands.Context, item_id: int):
+    """Đổi thưởng mặt hàng từ Shop Xu bằng ID (VD: >buy 1)."""
+    success, msg = await process_shop_purchase(ctx.guild, ctx.author, item_id)
+    if success:
+        embed = discord.Embed(
+            title="🎁 GIAO DỊCH ĐỔI THƯỞNG THÀNH CÔNG",
+            description=msg,
+            color=COLOR_SUCCESS,
+            timestamp=datetime.now(VN_TZ),
+        )
+        embed.set_thumbnail(url=ctx.author.display_avatar.url)
+        await ctx.reply(embed=embed)
+    else:
+        await ctx.reply(msg)
+
+
+@bot.command(name="addshopitem", aliases=["themshop", "taoshop"])
+@commands.has_permissions(administrator=True)
+async def cmd_addshopitem(
+    ctx: commands.Context,
+    item_type: str,
+    price_str: str,
+    item_name: str,
+    target: str = "0",
+    extra: str = "-1",
+):
+    """
+    Thêm mặt hàng mới vào Shop Đổi Thưởng (Chỉ Admin).
+    Cú pháp:
+    - Role: >addshopitem role 50k "Role VIP Bạc" @Role [kho]
+    - Key:  >addshopitem key 100k "Key VIP 7 Ngày" @Role 7 [kho]
+    - Khác: >addshopitem custom 20k "Thẻ Cào 10k" "Chi tiết quà" [kho]
+    """
+    itype = item_type.lower()
+    if itype not in ("role", "key", "custom"):
+        return await ctx.reply("❌ Loại mặt hàng phải là: `role`, `key`, hoặc `custom`!")
+
+    try:
+        price = parse_smart_amount(price_str)
+        if price <= 0:
+            raise ValueError()
+    except Exception:
+        return await ctx.reply("❌ Giá Xu không hợp lệ! (VD: `50k`, `100000`, `1.5m`)")
+
+    role_id = 0
+    key_days = 0
+    stock = -1
+    description = ""
+
+    if itype == "role":
+        m_role = re.search(r"\d+", target)
+        if not m_role:
+            return await ctx.reply("❌ Bạn chưa chỉ định @Role phần thưởng!")
+        role_id = int(m_role.group())
+        role = ctx.guild.get_role(role_id)
+        if not role:
+            return await ctx.reply(f"❌ Không tìm thấy Role với ID `{role_id}` trên máy chủ!")
+        try:
+            stock = int(extra)
+        except ValueError:
+            stock = -1
+
+    elif itype == "key":
+        m_role = re.search(r"\d+", target)
+        if not m_role:
+            return await ctx.reply("❌ Bạn chưa chỉ định @Role cho Key!")
+        role_id = int(m_role.group())
+        try:
+            key_days = int(extra)
+        except ValueError:
+            key_days = 30
+        stock = -1
+
+    else:
+        description = target
+        try:
+            stock = int(extra)
+        except ValueError:
+            stock = -1
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO shop_items (guild_id, item_name, item_type, price_coins, role_id, key_days, stock, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ctx.guild.id, item_name, itype, price, role_id, key_days, stock, description),
+        )
+        new_id = cursor.lastrowid
+        conn.commit()
+
+    embed = discord.Embed(
+        title="✅ ĐÃ THÊM MẶT HÀNG MỚI VÀO SHOP XU",
+        description=(
+            f"┃ ➡️ **ID mặt hàng:** `#{new_id}`\n"
+            f"┃ ➡️ **Tên món:** **{item_name}**\n"
+            f"┃ ➡️ **Loại:** `{itype.upper()}`\n"
+            f"┃ ➡️ **Giá đổi:** 🪙 **`{format_vnd(price)}`**\n"
+            f"┃ ➡️ **Tồn kho:** `{'Vô hạn' if stock == -1 else f'{stock} lượt'}`\n\n"
+            f"💡 Thành viên có thể gõ `>shop` hoặc `>buy {new_id}` để đổi thưởng ngay!"
+        ),
+        color=COLOR_SUCCESS,
+        timestamp=datetime.now(VN_TZ),
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="delshopitem", aliases=["xoashop"])
+@commands.has_permissions(administrator=True)
+async def cmd_delshopitem(ctx: commands.Context, item_id: int):
+    """Xóa mặt hàng khỏi Shop Đổi Thưởng theo ID (Chỉ Admin)."""
+    with get_db() as conn:
+        row = conn.execute("SELECT item_name FROM shop_items WHERE guild_id = ? AND id = ?", (ctx.guild.id, item_id)).fetchone()
+        if not row:
+            return await ctx.reply(f"❌ Không tìm thấy mặt hàng với ID `#{item_id}` trong Shop!")
+        conn.execute("DELETE FROM shop_items WHERE guild_id = ? AND id = ?", (ctx.guild.id, item_id))
+        conn.commit()
+    await ctx.reply(f"✅ Đã xóa mặt hàng **{row['item_name']}** (`#{item_id}`) khỏi Shop!")
+
+
+@bot.command(name="clearshop", aliases=["xoatatcashop"])
+@commands.has_permissions(administrator=True)
+async def cmd_clearshop(ctx: commands.Context):
+    """Xóa toàn bộ mặt hàng trong Shop Đổi Thưởng của Server (Chỉ Admin)."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM shop_items WHERE guild_id = ?", (ctx.guild.id,))
+        conn.commit()
+    await ctx.reply("✅ Đã xóa sạch toàn bộ mặt hàng trong Shop Đổi Thưởng của Server!")
+
+
 # --- 5. HỒ SƠ KHÁCH HÀNG VIP, THÔNG TIN SERVER & THÔNG BÁO ---
 @bot.command(name="profile", aliases=["hoso", "me"])
 async def cmd_profile(ctx: commands.Context, member: discord.Member = None):
     """Xem hồ sơ khách hàng VIP, tổng chi tiêu tại Store và số Xu."""
     target = member or ctx.author
-    with get_db() as conn:
-        spent_row = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) as s, COUNT(*) as c FROM store_revenues WHERE guild_id = ? AND customer_id = ?",
-            (ctx.guild.id, target.id),
-        ).fetchone()
-
+    spent, orders = get_user_total_spent(ctx.guild.id, target.id)
     coins = get_user_balance(ctx.guild.id, target.id)
-    spent = spent_row["s"] if spent_row else 0
-    orders = spent_row["c"] if spent_row else 0
 
-    if spent >= 5000000:
-        vip_rank = "💎 KIM CƯƠNG VIP"
-    elif spent >= 1000000:
-        vip_rank = "🥇 VÀNG VIP"
-    elif spent >= 200000:
-        vip_rank = "🥈 BẠC THÂN THIẾT"
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (ctx.guild.id,),
+        ).fetchall()
+
+    current_tier = None
+    next_tier = None
+    for t in tiers:
+        if spent >= t["required_spent"]:
+            current_tier = t
+        elif next_tier is None:
+            next_tier = t
+
+    vip_rank = current_tier["tier_name"] if current_tier else (
+        "💎 VIP 5M (KIM CƯƠNG)" if spent >= 5000000 else (
+            "👑 VIP 2M (CHÍ TÔN)" if spent >= 2000000 else (
+                "🥇 VIP 1M (HOÀNG GIA)" if spent >= 1000000 else (
+                    "✨ VIP 500K (VÀNG)" if spent >= 500000 else (
+                        "🥈 VIP 200K (BẠC)" if spent >= 200000 else (
+                            "🥈 VIP 100K" if spent >= 100000 else (
+                                "🥉 VIP 50K" if spent >= 50000 else "🌱 THÀNH VIÊN MỚI"
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+
+    if next_tier:
+        rem = next_tier["required_spent"] - spent
+        p_bar = make_spending_progress_bar(spent, next_tier["required_spent"])
+        progress_str = f"{p_bar} *(Còn thiếu {format_vnd(rem)} lên {next_tier['tier_name']})*"
+    elif current_tier:
+        progress_str = "🏆 **Đã đạt mốc VIP tối đa!**"
     else:
-        vip_rank = "🥉 THÀNH VIÊN MỚI"
+        progress_str = "💡 *Dùng `>setviptier` để đặt mốc thăng hạng Role*"
 
     embed = discord.Embed(
         title=f"👑 THẺ HỒ SƠ KHÁCH HÀNG: {target.display_name.upper()}",
         description=(
             f"┃ ➡️ **Khách hàng:** {target.mention} (`{target.id}`)\n"
             f"┃ ➡️ **Hạng thành viên:** **{vip_rank}**\n"
-            f"┃ ➡️ **Tổng tiền đã mua:** 💎 **`{format_vnd(spent)}`**\n"
-            f"┃ ➡️ **Số đơn hàng đã chốt:** 📦 **`{orders} đơn`**\n"
+            f"┃ ➡️ **Tổng tiền đã chi:** 💎 **`{format_vnd(spent)}`**\n"
+            f"┃ ➡️ **Số đơn đã chốt:** 📦 **`{orders} đơn`**\n"
+            f"┃ ➡️ **Tiến độ mốc VIP:** {progress_str}\n"
             f"┃ ➡️ **Ví Xu Store:** 🪙 **`{format_vnd(coins)}`**\n"
             f"┃ ➡️ **Ngày tham gia:** `{target.joined_at.astimezone(VN_TZ).strftime('%d/%m/%Y') if target.joined_at else 'N/A'}`"
         ),
@@ -3916,7 +4825,696 @@ async def cmd_profile(ctx: commands.Context, member: discord.Member = None):
         timestamp=datetime.now(VN_TZ),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.set_footer(text="Hệ thống Khách Hàng Thân Thiết Store")
+    embed.set_footer(text="Hệ thống Khách Hàng Thân Thiết Store • Trao Role Tự Động")
+    await ctx.reply(embed=embed)
+
+
+# --- 5B. HỆ THỐNG MỐC CHI TIÊU & TỰ ĐỘNG THĂNG HẠNG ROLE VIP ---
+@bot.command(name="spent", aliases=["chitieu", "tiendachi", "tongchi"])
+async def cmd_spent(ctx: commands.Context, member: discord.Member = None):
+    """Xem tổng số tiền đã chi tiêu cho Server, hạng VIP và tiến độ mốc tiếp theo."""
+    target = member or ctx.author
+    spent, orders = get_user_total_spent(ctx.guild.id, target.id)
+
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (ctx.guild.id,),
+        ).fetchall()
+
+    current_tier = None
+    next_tier = None
+    for t in tiers:
+        if spent >= t["required_spent"]:
+            current_tier = t
+        elif next_tier is None:
+            next_tier = t
+
+    current_tier_name = current_tier["tier_name"] if current_tier else "Thành viên mới"
+    current_role_str = f" (<@&{current_tier['role_id']}>)" if current_tier else ""
+
+    embed = discord.Embed(
+        title=f"💎 HỒ SƠ CHI TIÊU STORE: {target.display_name.upper()}",
+        description=(
+            f"┃ ➡️ **Khách hàng:** {target.mention} (`{target.id}`)\n"
+            f"┃ ➡️ **Tổng tiền đã chi:** 💎 **`{format_vnd(spent)}`**\n"
+            f"┃ ➡️ **Số đơn hàng đã chốt:** 📦 **`{orders} đơn`**\n"
+            f"┃ ➡️ **Hạng VIP hiện tại:** **{current_tier_name}**{current_role_str}"
+        ),
+        color=COLOR_CYAN,
+        timestamp=datetime.now(VN_TZ),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+
+    if next_tier:
+        rem = next_tier["required_spent"] - spent
+        p_bar = make_spending_progress_bar(spent, next_tier["required_spent"])
+        role_mention = f"<@&{next_tier['role_id']}>"
+        embed.add_field(
+            name="🚀 Mốc Nâng Cấp VIP Tiếp Theo",
+            value=(
+                f"┃ ➡️ **Mục tiêu:** **{next_tier['tier_name']}** ({role_mention})\n"
+                f"┃ ➡️ **Mốc yêu cầu:** 💎 **`{format_vnd(next_tier['required_spent'])}`**\n"
+                f"┃ ➡️ **Còn thiếu:** 🪙 **`{format_vnd(rem)}`**\n"
+                f"┃ ➡️ **Tiến độ:** {p_bar}"
+            ),
+            inline=False,
+        )
+    elif current_tier:
+        embed.add_field(
+            name="🏆 Cấp Bậc Danh Giá",
+            value="🎉 Chúc mừng bạn đã chinh phục mốc VIP cao nhất của Server!",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="💡 Mẹo Nâng Cấp VIP",
+            value="Mỗi khi bạn mua hàng qua Ticket (`>done` hoặc `>sellstock`), tiền sẽ được cộng dồn tự động để nâng cấp Role VIP!",
+            inline=False,
+        )
+
+    embed.set_footer(text="Hệ Thống Tích Lũy Chi Tiêu & Nâng Cấp Role VIP Tự Động")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="viptiers", aliases=["moctietieu", "viproles", "dsphanthuong"])
+async def cmd_viptiers(ctx: commands.Context):
+    """Xem danh sách các mốc chi tiêu nâng cấp Role VIP của Server."""
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (ctx.guild.id,),
+        ).fetchall()
+
+    embed = discord.Embed(
+        title=f"👑 BẢNG MỐC CHI TIÊU NÂNG CẤP ROLE VIP - {ctx.guild.name.upper()}",
+        description="Khách hàng tích lũy đủ chi tiêu sẽ được **Bot tự động trao Role VIP** ngay lập tức!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        color=COLOR_GOLD,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    if not tiers:
+        embed.add_field(
+            name="⚠️ Chưa Có Mốc Chi Tiêu",
+            value=(
+                "*Server chưa thiết lập mốc nâng cấp Role nào.*\n"
+                "👉 Quản trị viên hãy dùng lệnh **1-click tự động tạo toàn bộ Role VIP**:\n"
+                "`>setupviproles` (tự tạo role 50k, 100k, 200k, 500k, 1M, 2M, 5M)\n\n"
+                "👉 Hoặc tạo từng mốc riêng (bot sẽ tự tạo Role mới nếu chưa có):\n"
+                "`>setviptier 50k` hoặc `>setviptier 100k`"
+            ),
+            inline=False,
+        )
+    else:
+        for t in tiers:
+            role = ctx.guild.get_role(t["role_id"])
+            role_str = role.mention if role else f"`ID: {t['role_id']}`"
+            embed.add_field(
+                name=f"💎 [ID: #{t['id']}] {t['tier_name']} • Mốc: {format_vnd(t['required_spent'])}",
+                value=f"┃ ➡️ **Role trao thưởng:** {role_str}\n┃ ➡️ **Ngày tạo:** `{t['created_at']}`",
+                inline=False,
+            )
+
+    embed.set_footer(text="Admin dùng >setupviproles để tạo nhanh, >setviptier để thêm lẻ, >delviptier để xóa")
+    await ctx.reply(embed=embed)
+
+
+def get_vip_color_by_amount(amount: int) -> discord.Color:
+    """Trả về mã màu tương ứng cho từng mốc VIP."""
+    if amount >= 5000000:
+        return discord.Color.from_rgb(0, 255, 255)    # 5M: Cyan Diamond
+    if amount >= 2000000:
+        return discord.Color.from_rgb(155, 89, 182)  # 2M: Purple Chí Tôn
+    if amount >= 1000000:
+        return discord.Color.from_rgb(241, 196, 15)   # 1M: Gold Hoàng Gia
+    if amount >= 500000:
+        return discord.Color.from_rgb(52, 152, 219)   # 500k: Sapphire Blue
+    if amount >= 200000:
+        return discord.Color.from_rgb(46, 204, 113)   # 200k: Emerald Green
+    if amount >= 100000:
+        return discord.Color.from_rgb(192, 192, 192)  # 100k: Silver Bạc
+    return discord.Color.from_rgb(205, 127, 50)        # 50k: Bronze Đồng
+
+
+DEFAULT_VIP_TIERS_CONFIG = [
+    (50000, "🥉 VIP 50K", discord.Color.from_rgb(205, 127, 50)),
+    (100000, "🥈 VIP 100K", discord.Color.from_rgb(192, 192, 192)),
+    (200000, "🥉 VIP 200K (Bạc)", discord.Color.from_rgb(46, 204, 113)),
+    (500000, "🥈 VIP 500K (Vàng)", discord.Color.from_rgb(52, 152, 219)),
+    (1000000, "🥇 VIP 1M (Hoàng Gia)", discord.Color.from_rgb(241, 196, 15)),
+    (2000000, "👑 VIP 2M (Chí Tôn)", discord.Color.from_rgb(155, 89, 182)),
+    (5000000, "💎 VIP 5M (Kim Cương)", discord.Color.from_rgb(0, 255, 255)),
+]
+
+
+@bot.command(name="setupviproles", aliases=["taorolevip", "initviptiers", "setupvip", "taomocvip"])
+@commands.has_permissions(administrator=True)
+async def cmd_setupviproles(ctx: commands.Context):
+    """
+    ⚡ 1-Click: Tự động tạo toàn bộ các Role VIP trên Server và cấu hình các mốc chi tiêu chuẩn.
+    Bao gồm các mốc: 50k, 100k, 200k, 500k, 1M, 2M, 5M.
+    Nếu Role đã tồn tại, bot sẽ sử dụng lại. Nếu chưa có, bot sẽ TỰ ĐỘNG TẠO ROLE MỚI!
+    """
+    if not ctx.guild.me.guild_permissions.manage_roles:
+        return await ctx.reply("❌ Bot cần có quyền **Quản Lý Vai Trò (Manage Roles)** để tự động tạo và gán Role trên Server!")
+
+    loading_msg = await ctx.reply("⏳ Đang khởi tạo và cấu hình hệ thống Role VIP tự động...")
+    status_lines = []
+    now_str = datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M")
+
+    with get_db() as conn:
+        for amount, default_name, color in DEFAULT_VIP_TIERS_CONFIG:
+            matched_role = None
+            for r in ctx.guild.roles:
+                if r.name.lower() == default_name.lower():
+                    matched_role = r
+                    break
+
+            created_new = False
+            if not matched_role:
+                try:
+                    matched_role = await ctx.guild.create_role(
+                        name=default_name,
+                        color=color,
+                        hoist=True,
+                        reason="Hệ thống VIP tự động khởi tạo vai trò chi tiêu",
+                    )
+                    created_new = True
+                except Exception as e:
+                    status_lines.append(f"⚠️ Mốc **{format_vnd(amount)}**: Lỗi tạo role: `{e}`")
+                    continue
+
+            # Cập nhật hoặc chèn vào database
+            existing = conn.execute(
+                "SELECT id FROM vip_tiers WHERE guild_id = ? AND required_spent = ?",
+                (ctx.guild.id, amount),
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE vip_tiers SET tier_name = ?, role_id = ? WHERE id = ?",
+                    (matched_role.name, matched_role.id, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO vip_tiers (guild_id, tier_name, required_spent, role_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (ctx.guild.id, matched_role.name, amount, matched_role.id, now_str),
+                )
+
+            tag_status = "✨ *Tạo mới*" if created_new else "🔄 *Đã có sẵn*"
+            status_lines.append(
+                f"┃ ➡️ **`{format_vnd(amount):>10}`** ➔ {matched_role.mention} ({tag_status})"
+            )
+        conn.commit()
+
+    embed = discord.Embed(
+        title="👑 KHỞI TẠO HỆ THỐNG ROLE VIP TỰ ĐỘNG THÀNH CÔNG",
+        description=(
+            "Đã tự động khởi tạo và cấu hình đầy đủ các mốc Role VIP trên Server:\n\n"
+            + "\n".join(status_lines)
+            + "\n\n"
+            "💡 **Hướng dẫn tiếp theo:**\n"
+            "1. **Quan trọng:** Vào **Cài đặt Server ➔ Vai trò**, kéo Role của Bot lên cao hơn các Role VIP vừa tạo để Bot có quyền trao Role!\n"
+            "2. Gõ `>syncvip all` để quét và trao ngay Role VIP cho các khách đã chi tiêu trước đây!\n"
+            "3. Khi khách chốt đơn qua `>done` hoặc `>sellstock`, Bot sẽ tự động nâng cấp Role và gửi thông báo chúc mừng!"
+        ),
+        color=COLOR_SUCCESS,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    await loading_msg.edit(content=None, embed=embed)
+
+
+@bot.command(name="setviptier", aliases=["themviptier", "caidatvip", "taorole"])
+@commands.has_permissions(administrator=True)
+async def cmd_setviptier(ctx: commands.Context, amount_str: str, *, role_or_name: str = None):
+    """
+    Thiết lập mốc chi tiêu nâng cấp Role VIP (Chỉ Admin).
+    Hỗ trợ TỰ ĐỘNG TẠO ROLE MỚI TRÊN DISCORD nếu chưa có Role!
+
+    Cú pháp:
+      >setviptier <tiền>                (Tự tạo Role "VIP <tiền>")
+      >setviptier <tiền> <tên_role>     (Tự tạo Role với tên chỉ định)
+      >setviptier <tiền> @Role          (Dùng Role có sẵn)
+      >setviptier <tiền> @Role <tên>    (Dùng Role có sẵn + đặt tên riêng)
+
+    Ví dụ:
+      >setviptier 50k
+      >setviptier 100k
+      >setviptier 200k VIP Bạc
+      >setviptier 500k @VIP-Vàng
+    """
+    try:
+        amount = parse_smart_amount(amount_str)
+        if amount <= 0:
+            raise ValueError()
+    except Exception:
+        return await ctx.reply("❌ Định dạng số tiền mốc không hợp lệ! Ví dụ: `50k`, `100k`, `200k`, `1m`, `5000000`...")
+
+    target_role = None
+    name = None
+
+    # 1. Kiểm tra nếu có mention role
+    if ctx.message.role_mentions:
+        target_role = ctx.message.role_mentions[0]
+        if role_or_name:
+            clean_name = re.sub(r"<@&\d+>", "", role_or_name).strip()
+            if clean_name:
+                name = clean_name
+    elif role_or_name:
+        role_or_name_clean = role_or_name.strip()
+        # Kiểm tra nếu là role ID
+        if role_or_name_clean.isdigit():
+            target_role = ctx.guild.get_role(int(role_or_name_clean))
+        
+        # Nếu chưa thấy, tìm theo tên role trong server
+        if not target_role:
+            for r in ctx.guild.roles:
+                if r.name.lower() == role_or_name_clean.lower():
+                    target_role = r
+                    break
+
+        # Nếu không có role sẵn, đặt tên mong muốn để bot tự tạo role mới
+        if not target_role:
+            name = role_or_name_clean
+
+    # Nếu không chỉ định tên và không có role, tự đặt tên theo định dạng chuẩn
+    if not target_role and not name:
+        if amount >= 1000000:
+            val = amount / 1000000
+            label = f"{int(val) if val.is_integer() else val}M"
+        elif amount >= 1000:
+            val = amount / 1000
+            label = f"{int(val) if val.is_integer() else val}K"
+        else:
+            label = str(amount)
+        name = f"VIP {label}"
+
+    # Tự động tạo Role mới trên Discord nếu chưa có
+    created_new = False
+    if not target_role:
+        if not ctx.guild.me.guild_permissions.manage_roles:
+            return await ctx.reply(
+                "❌ Bot cần có quyền **Quản Lý Vai Trò (Manage Roles)** để tự động tạo Role trên Server!\n"
+                "👉 Bạn có thể cấp quyền cho Bot hoặc tạo Role trước rồi gõ: `>setviptier " + amount_str + " @Role`"
+            )
+        try:
+            target_color = get_vip_color_by_amount(amount)
+            target_role = await ctx.guild.create_role(
+                name=name,
+                color=target_color,
+                hoist=True,
+                reason=f"Hệ thống VIP tự động tạo vai trò cho mốc {format_vnd(amount)}",
+            )
+            created_new = True
+        except Exception as e:
+            return await ctx.reply(f"❌ Không thể tự tạo role trên server: {e}")
+
+    if not name:
+        name = target_role.name
+
+    now_str = datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        existing = conn.execute(
+            "SELECT id FROM vip_tiers WHERE guild_id = ? AND required_spent = ?",
+            (ctx.guild.id, amount),
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE vip_tiers SET tier_name = ?, role_id = ? WHERE id = ?",
+                (name, target_role.id, existing["id"]),
+            )
+            new_id = existing["id"]
+        else:
+            cursor.execute(
+                """
+                INSERT INTO vip_tiers (guild_id, tier_name, required_spent, role_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (ctx.guild.id, name, amount, target_role.id, now_str),
+            )
+            new_id = cursor.lastrowid
+        conn.commit()
+
+    role_note = "✨ **(Bot vừa tự động tạo mới trên Discord!)**" if created_new else "🔄 *(Sử dụng Role sẵn có)*"
+    embed = discord.Embed(
+        title="✅ ĐÃ THIẾT LẬP MỐC ROLE VIP MỚI",
+        description=(
+            f"┃ ➡️ **Mã mốc (ID):** `#{new_id}`\n"
+            f"┃ ➡️ **Tên hạng:** **{name}**\n"
+            f"┃ ➡️ **Mốc chi tiêu yêu cầu:** 💎 **`{format_vnd(amount)}`**\n"
+            f"┃ ➡️ **Role tự động trao:** {target_role.mention} {role_note}\n\n"
+            f"💡 Khi khách đạt mốc qua `>done` hoặc `>sellstock`, Bot sẽ tự động trao Role và chúc mừng!\n"
+            f"👉 Dùng `>syncvip` để đồng bộ ngay cho các thành viên hiện tại."
+        ),
+        color=COLOR_SUCCESS,
+        timestamp=datetime.now(VN_TZ),
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="delviptier", aliases=["xoaviptier"])
+@commands.has_permissions(administrator=True)
+async def cmd_delviptier(ctx: commands.Context, tier_id: int):
+    """Xóa một mốc chi tiêu VIP theo ID (Chỉ Admin)."""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM vip_tiers WHERE guild_id = ? AND id = ?", (ctx.guild.id, tier_id)).fetchone()
+        if not row:
+            return await ctx.reply(f"❌ Không tìm thấy mốc VIP nào với ID `#{tier_id}`!")
+        conn.execute("DELETE FROM vip_tiers WHERE guild_id = ? AND id = ?", (ctx.guild.id, tier_id))
+        conn.commit()
+
+    await ctx.reply(f"✅ Đã xóa mốc VIP **{row['tier_name']}** (`#{tier_id}`) thành công!")
+
+
+@bot.command(name="syncvip", aliases=["quetvip", "dongbovip"])
+@commands.has_permissions(administrator=True)
+async def cmd_syncvip(ctx: commands.Context, target: str = "all"):
+    """
+    Quét lại chi tiêu và tự động cấp Role VIP cho người đủ mốc (Chỉ Admin).
+    Cú pháp: `>syncvip @user` hoặc `>syncvip all`
+    """
+    msg = await ctx.reply("⏳ Đang quét cơ sở dữ liệu và đồng bộ Role VIP...")
+
+    with get_db() as conn:
+        tiers = conn.execute(
+            "SELECT * FROM vip_tiers WHERE guild_id = ? ORDER BY required_spent ASC",
+            (ctx.guild.id,),
+        ).fetchall()
+
+    if not tiers:
+        return await msg.edit(content="❌ Server chưa cài đặt mốc VIP nào! Hãy dùng `>setviptier` trước nhé.")
+
+    upgraded_count = 0
+    members_to_check = []
+
+    if ctx.message.mentions:
+        members_to_check = ctx.message.mentions
+    elif target.lower() in ("all", "tatca"):
+        members_to_check = [m for m in ctx.guild.members if not m.bot]
+    else:
+        m_id = re.search(r"\d+", target)
+        if m_id:
+            m = ctx.guild.get_member(int(m_id.group()))
+            if m:
+                members_to_check = [m]
+
+    if not members_to_check:
+        return await msg.edit(content="❌ Không tìm thấy thành viên cần đồng bộ!")
+
+    for mem in members_to_check:
+        upgraded = await check_and_upgrade_vip_role(ctx.guild, mem)
+        if upgraded:
+            upgraded_count += len(upgraded)
+
+    await msg.edit(
+        content=(
+            f"✅ **ĐỒNG BỘ ROLE VIP HOÀN TẤT!**\n"
+            f"┃ ➡️ Đã kiểm tra: **{len(members_to_check)}** thành viên\n"
+            f"┃ ➡️ Đã trao mới: **{upgraded_count}** lượt Role VIP đạt mốc!"
+        )
+    )
+
+
+# =============================================================================
+# XII. HỆ THỐNG CẤP ĐỘ, XP & THÔNG BÁO THĂNG CẤP (>rank, >toplevel, >setlevelupchannel)
+# =============================================================================
+@bot.command(name="rank", aliases=["level", "capdo", "lv"])
+async def cmd_rank(ctx: commands.Context, member: discord.Member = None):
+    """Xem thẻ cấp độ, kinh nghiệm XP và thứ hạng hoạt động trong Server."""
+    target = member or ctx.author
+    if target.bot:
+        return await ctx.reply("❌ Bot không tham gia hệ thống cấp độ!")
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_levels WHERE user_id = ? AND guild_id = ?",
+            (target.id, ctx.guild.id),
+        ).fetchone()
+
+        if not row:
+            xp = 0
+            level = 1
+            messages = 0
+        else:
+            xp = row["xp"]
+            level = row["level"]
+            messages = row["messages_count"] or 0
+
+        # Tính thứ hạng rank trong server
+        rank_pos = conn.execute(
+            """
+            SELECT COUNT(*) + 1 FROM user_levels
+            WHERE guild_id = ? AND (level > ? OR (level = ? AND xp > ?))
+            """,
+            (ctx.guild.id, level, level, xp),
+        ).fetchone()[0]
+
+    needed_xp = xp_needed_for_level(level)
+    p_bar = make_spending_progress_bar(xp, needed_xp)
+
+    embed = discord.Embed(
+        title=f"📊 HỒ SƠ CẤP ĐỘ: {target.display_name.upper()}",
+        description=(
+            f"┃ ➡️ **Thành viên:** {target.mention} (`{target.id}`)\n"
+            f"┃ ➡️ **Cấp độ hiện tại:** 🚀 **Level {level}**\n"
+            f"┃ ➡️ **Thứ hạng hoạt động:** 🏆 **Top #{rank_pos}**\n"
+            f"┃ ➡️ **Điểm kinh nghiệm:** ✨ **`{xp} / {needed_xp} XP`**\n"
+            f"┃ ➡️ **Tiến độ thăng cấp:** {p_bar}\n"
+            f"┃ ➡️ **Tổng tin nhắn:** 💬 **`{messages:,} tin`**"
+        ),
+        color=COLOR_PRIMARY,
+        timestamp=datetime.now(VN_TZ),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text=f"Tương tác chat để nhận XP & thăng cấp • {ctx.guild.name}")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="toplevel", aliases=["toprank", "topcapdo", "bxhlevel"])
+async def cmd_toplevel(ctx: commands.Context):
+    """Xem Bảng Xếp Hạng Top 10 thành viên hoạt động tích cực nhất theo Level."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, level, xp, messages_count
+            FROM user_levels
+            WHERE guild_id = ?
+            ORDER BY level DESC, xp DESC
+            LIMIT 10
+            """,
+            (ctx.guild.id,),
+        ).fetchall()
+
+    embed = discord.Embed(
+        title=f"🚀 BẢNG XẾP HẠNG TOP LEVEL TƯƠNG TÁC - {ctx.guild.name.upper()}",
+        description="Top 10 thành viên có cấp độ & số tin nhắn cao nhất máy chủ:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        color=COLOR_CYAN,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    if not rows:
+        embed.description += "\n\n*Chưa có dữ liệu thành viên nào tương tác trong Server.*"
+    else:
+        rank_medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = []
+        for idx, r in enumerate(rows, start=1):
+            uid = r["user_id"]
+            lvl = r["level"]
+            xp = r["xp"]
+            msgs = r["messages_count"] or 0
+            medal = rank_medals.get(idx, f"`#{idx:02d}`")
+            member = ctx.guild.get_member(uid)
+            display_name = member.mention if member else f"`User ID: {uid}`"
+            lines.append(f"{medal} **{display_name}** • 🚀 **Level {lvl}** *({xp} XP | {msgs:,} tin)*")
+
+        embed.add_field(name="🏆 Bảng Vinh Danh Hoạt Bát", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="Gõ >rank để xem hồ sơ cấp độ của bạn • HwightSuperFriendZone")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="setlevelupchannel", aliases=["kenhthangcap", "kenhlevel", "setlevelchannel"])
+@commands.has_permissions(administrator=True)
+async def cmd_setlevelupchannel(ctx: commands.Context, channel: discord.TextChannel = None):
+    """
+    Cài đặt kênh thông báo thăng cấp và PING người dùng khi lên Level (Chỉ Admin).
+    Cú pháp: >setlevelupchannel #kênh-thông-báo hoặc >setlevelupchannel (để thông báo tại kênh chat).
+    """
+    channel_id = channel.id if channel else 0
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE store_settings SET levelup_channel_id = ? WHERE guild_id = ?",
+            (channel_id, ctx.guild.id),
+        )
+        conn.commit()
+
+    if channel:
+        embed = discord.Embed(
+            title="✅ ĐÃ THIẾT LẬP KÊNH THÔNG BÁO THĂNG CẤP",
+            description=(
+                f"┃ ➡️ **Kênh chỉ định:** {channel.mention}\n"
+                f"┃ ➡️ **Cơ chế:** Khi bất kỳ thành viên nào chat tương tác đủ điểm lên cấp, Bot sẽ **PING trực tiếp** người đó vào {channel.mention} kèm bảng vinh danh xịn xò!\n"
+            ),
+            color=COLOR_SUCCESS,
+            timestamp=datetime.now(VN_TZ),
+        )
+        await ctx.reply(embed=embed)
+    else:
+        await ctx.reply("✅ Đã hủy kênh chỉ định! Bot sẽ thông báo và ping thăng cấp ngay tại kênh chat mà thành viên vừa nhắn.")
+
+
+@bot.command(name="addlevelrole", aliases=["themlevelrole", "setlevelrole", "taolevelrole"])
+@commands.has_permissions(administrator=True)
+async def cmd_addlevelrole(ctx: commands.Context, level: int, *, role_or_name: str = None):
+    """
+    Gán Role thưởng tự động khi thành viên đạt cấp độ nhất định (Chỉ Admin).
+    Hỗ trợ TỰ ĐỘNG TẠO ROLE MỚI TRÊN DISCORD nếu chưa có Role!
+
+    Cú pháp:
+      >addlevelrole <level>             (Tự tạo Role "🚀 Level <level>")
+      >addlevelrole <level> <tên_role>  (Tự tạo Role với tên chỉ định)
+      >addlevelrole <level> @Role       (Dùng Role đã có sẵn)
+
+    Ví dụ:
+      >addlevelrole 5
+      >addlevelrole 10 Hoạt Bát
+      >addlevelrole 20 @VIP-Chuyên-Cần
+    """
+    if level < 2:
+        return await ctx.reply("❌ Cấp độ thưởng phải từ Level 2 trở lên!")
+
+    target_role = None
+    created_new = False
+
+    if ctx.message.role_mentions:
+        target_role = ctx.message.role_mentions[0]
+    elif role_or_name:
+        role_or_name_clean = role_or_name.strip()
+        if role_or_name_clean.isdigit():
+            target_role = ctx.guild.get_role(int(role_or_name_clean))
+        if not target_role:
+            for r in ctx.guild.roles:
+                if r.name.lower() == role_or_name_clean.lower():
+                    target_role = r
+                    break
+        if not target_role:
+            if not ctx.guild.me.guild_permissions.manage_roles:
+                return await ctx.reply("❌ Bot cần có quyền **Quản Lý Vai Trò (Manage Roles)** để tự động tạo Role trên Server!")
+            try:
+                target_role = await ctx.guild.create_role(
+                    name=role_or_name_clean,
+                    color=discord.Color.from_rgb(114, 137, 218),
+                    hoist=True,
+                    reason=f"Hệ thống Level tự động tạo Role cho Level {level}",
+                )
+                created_new = True
+            except Exception as e:
+                return await ctx.reply(f"❌ Không thể tạo Role mới trên server: {e}")
+    else:
+        role_name = f"🚀 Level {level}"
+        for r in ctx.guild.roles:
+            if r.name.lower() == role_name.lower():
+                target_role = r
+                break
+        if not target_role:
+            if not ctx.guild.me.guild_permissions.manage_roles:
+                return await ctx.reply("❌ Bot cần có quyền **Quản Lý Vai Trò (Manage Roles)** để tự động tạo Role trên Server!")
+            try:
+                target_role = await ctx.guild.create_role(
+                    name=role_name,
+                    color=discord.Color.from_rgb(114, 137, 218),
+                    hoist=True,
+                    reason=f"Hệ thống Level tự động tạo Role cho Level {level}",
+                )
+                created_new = True
+            except Exception as e:
+                return await ctx.reply(f"❌ Không thể tạo Role mới trên server: {e}")
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO level_roles (guild_id, level_req, role_id)
+            VALUES (?, ?, ?)
+            """,
+            (ctx.guild.id, level, target_role.id),
+        )
+        conn.commit()
+
+    role_note = "✨ **(Bot vừa tự động tạo mới trên Discord!)**" if created_new else "🔄 *(Sử dụng Role sẵn có)*"
+    embed = discord.Embed(
+        title="✅ ĐÃ THIẾT LẬP ROLE THƯỞNG CẤP ĐỘ",
+        description=(
+            f"┃ ➡️ **Mốc Cấp Độ:** 🚀 **Level {level}**\n"
+            f"┃ ➡️ **Role Trao Thưởng:** {target_role.mention} {role_note}\n\n"
+            f"💡 Khi thành viên tương tác đạt **Level {level}**, Bot sẽ tự động trao Role này và ping thông báo!"
+        ),
+        color=COLOR_SUCCESS,
+        timestamp=datetime.now(VN_TZ),
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="dellevelrole", aliases=["xoalevelrole"])
+@commands.has_permissions(administrator=True)
+async def cmd_dellevelrole(ctx: commands.Context, level: int):
+    """Xóa Role thưởng của một cấp độ (Chỉ Admin)."""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM level_roles WHERE guild_id = ? AND level_req = ?", (ctx.guild.id, level)).fetchone()
+        if not row:
+            return await ctx.reply(f"❌ Không tìm thấy Role thưởng nào cài cho **Level {level}**!")
+        conn.execute("DELETE FROM level_roles WHERE guild_id = ? AND level_req = ?", (ctx.guild.id, level))
+        conn.commit()
+
+    await ctx.reply(f"✅ Đã xóa Role thưởng của **Level {level}** thành công!")
+
+
+@bot.command(name="levelroles", aliases=["dslevelrole"])
+async def cmd_levelroles(ctx: commands.Context):
+    """Xem danh sách các Role thưởng theo Cấp độ trong Server."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM level_roles WHERE guild_id = ? ORDER BY level_req ASC",
+            (ctx.guild.id,),
+        ).fetchall()
+
+    embed = discord.Embed(
+        title=f"👑 DANH SÁCH ROLE THƯỞNG THEO LEVEL - {ctx.guild.name.upper()}",
+        description="Đạt các mốc Cấp độ tương tác sau để mở khóa Role danh giá tự động:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        color=COLOR_GOLD,
+        timestamp=datetime.now(VN_TZ),
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    if not rows:
+        embed.add_field(
+            name="⚠️ Chưa Có Role Thưởng",
+            value="*Server chưa gán Role thưởng cho Level nào.*\n👉 Admin dùng: `>addlevelrole <level> @Role` để tạo!",
+            inline=False,
+        )
+    else:
+        for r in rows:
+            role = ctx.guild.get_role(r["role_id"])
+            role_str = role.mention if role else f"`ID: {r['role_id']}`"
+            embed.add_field(
+                name=f"🚀 Cột Mốc: Level {r['level_req']}",
+                value=f"┃ ➡️ **Role nhận được:** {role_str}",
+                inline=False,
+            )
+
+    embed.set_footer(text="Admin dùng >addlevelrole để thêm hoặc >dellevelrole để xóa")
     await ctx.reply(embed=embed)
 
 
@@ -3959,7 +5557,7 @@ async def cmd_announce(ctx: commands.Context, channel: discord.TextChannel, *, c
 
 
 # --- 6. MENU TRỢ GIÚP TỔNG HỢP (>help) ---
-@bot.command(name="help")
+@bot.command(name="help", aliases=["lenh", "trogiup", "commands"])
 async def cmd_help(ctx: commands.Context):
     """Hiển thị toàn bộ danh sách lệnh của Bot Store."""
     embed = discord.Embed(
@@ -4004,19 +5602,39 @@ async def cmd_help(ctx: commands.Context):
         inline=False,
     )
     embed.add_field(
-        name="🪙 4. Ví Xu & Mini-Game Giải Trí",
+        name="🪙 4. Ví Xu, Đổi Thưởng & Bảng Xếp Hạng",
         value=(
+            "`>top [xu/daigia/legit]` : BXH Top Server 3 tab tương tác\n"
+            "`>shop` / `>buy <id>` : Cửa hàng đổi thưởng Role VIP/Key bằng Xu\n"
             "`>daily` : Điểm danh hàng ngày nhận 10.000đ - 50.000đ Xu\n"
             "`>bal [@user]` : Kiểm tra số dư ví Xu\n"
             "`>taixiu <tai/xiu> <tiền>` : Chơi Tài Xỉu 3 xúc xắc\n"
             "`>flip <ngua/sap> <tiền>` : Tung đồng xu may mắn\n"
             "`>pay @user <tiền>` : Chuyển Xu cho thành viên khác\n"
-            "`>profile [@user]` : Thẻ thành viên VIP & tổng chi tiêu"
+            "`>profile [@user]` : Thẻ thành viên VIP & tổng chi tiêu\n"
+            "`>addshopitem` / `>delshopitem` : (Admin) Quản lý Shop Xu"
         ),
         inline=False,
     )
     embed.add_field(
-        name="🛡️ 5. Quản Lý Server & Tiện Ích",
+        name="🚀 5. Cấp Độ Tương Tác & Mốc Chi Tiêu VIP",
+        value=(
+            "`>+<tiền> to @user` : ⚡ Cộng nhanh chi tiêu & tự động gán Role VIP\n"
+            "`>addspent @user <tiền>` : Cộng chi tiêu tích lũy cho khách hàng\n"
+            "`>setupviproles` : ⚡ 1-Click tự tạo trọn bộ Role VIP (50k - 5M)\n"
+            "`>setviptier <tiền> [tên]` : Thêm mốc VIP (Tự tạo Role mới trên Discord)\n"
+            "`>viptiers` / `>delviptier <id>` : Xem & xóa mốc Role VIP\n"
+            "`>spent [@user]` : Xem tổng tiền chi & tiến độ mốc VIP\n"
+            "`>syncvip [all/@user]` : Quét & trao Role VIP cho người đủ mốc\n"
+            "`>rank [@user]` : Thẻ Level, XP & thứ hạng tương tác\n"
+            "`>toplevel` : BXH Top 10 Level cao nhất Server\n"
+            "`>setlevelupchannel [#kênh]` : Kênh thông báo & PING khi lên cấp\n"
+            "`>addlevelrole <lvl> [tên]` : Thưởng Role khi đạt Level (Tự tạo Role)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ 6. Quản Lý Server & Tiện Ích",
         value=(
             "`>genkey` / `>redeem` : Hệ thống tạo & nhập Key VIP\n"
             "`>addrole` / `>removerole` / `>autorole`\n"
@@ -4029,6 +5647,9 @@ async def cmd_help(ctx: commands.Context):
         inline=False,
     )
     embed.set_footer(text="Bot hoạt động 24/7 • Thiết kế chuẩn UI/UX Store Discord")
+    await ctx.reply(embed=embed)
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     """Xử lý lỗi lệnh tập trung, thông báo thân thiện cho người dùng."""
