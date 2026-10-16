@@ -50,7 +50,13 @@ TOKEN = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Token bảo mật SePay/Casso (tùy chọn)
 PORT = int(os.getenv("PORT", 8080))
-DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+DEFAULT_DB_PATH = "/data/bot_data.db" if os.path.isdir("/data") else "bot_data.db"
+DB_PATH = os.getenv("DB_PATH", DEFAULT_DB_PATH)
+
+# Cấu hình ngân hàng mặc định qua biến môi trường (nếu chưa cấu hình trong DB)
+ENV_BANK_CODE = os.getenv("BANK_CODE", "MB")
+ENV_ACCOUNT_NO = os.getenv("ACCOUNT_NO", "0000000000")
+ENV_ACCOUNT_NAME = os.getenv("ACCOUNT_NAME", "CHU CUA HANG")
 
 # Múi giờ Việt Nam (UTC+7)
 VN_TZ = timezone(timedelta(hours=7))
@@ -466,7 +472,11 @@ def get_guild_settings(guild_id: int) -> dict:
         ).fetchone()
         if not row:
             conn.execute(
-                "INSERT INTO store_settings (guild_id) VALUES (?)", (guild_id,)
+                """
+                INSERT INTO store_settings (guild_id, bank_code, account_no, account_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                (guild_id, ENV_BANK_CODE.upper(), ENV_ACCOUNT_NO, ENV_ACCOUNT_NAME.upper()),
             )
             conn.commit()
             row = conn.execute(
@@ -2349,6 +2359,13 @@ async def on_ready():
             type=discord.ActivityType.watching, name="Store 24/7 | >help | >banggia"
         )
     )
+    # Tự động đồng bộ và khôi phục mốc VIP nếu database vừa được tạo mới sau khi deploy
+    for guild in bot.guilds:
+        try:
+            await ensure_guild_vip_tiers(guild)
+        except Exception:
+            pass
+
     print(f"✅ Bot đã sẵn sàng hoạt động: {bot.user} (ID: {bot.user.id})")
 
 
