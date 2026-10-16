@@ -5690,24 +5690,49 @@ async def handle_bank_webhook(request: web.Request):
     if WEBHOOK_SECRET:
         auth_header = request.headers.get("Authorization", "")
         if WEBHOOK_SECRET not in auth_header:
+            print("⚠️ [BANK WEBHOOK] Từ chối truy cập: Sai hoặc thiếu WEBHOOK_SECRET")
             return web.json_response({"success": False, "error": "Unauthorized"}, status=401)
 
     try:
         data = await request.json()
-    except Exception:
+        print(f"📥 [BANK WEBHOOK NHẬN DỮ LIỆU]: {data}")
+    except Exception as e:
+        print(f"⚠️ [BANK WEBHOOK] Lỗi phân tích JSON: {e}")
         return web.json_response({"success": False, "error": "Invalid JSON"}, status=400)
 
-    # Tương thích cấu trúc JSON của cả SePay (transferAmount, content) và Casso (data list)
+    # Tương thích tất cả cấu trúc JSON từ SePay, Casso hoặc custom webhook
     transactions = []
-    if "transferAmount" in data:
-        transactions.append(
-            {"amount": int(data.get("transferAmount", 0)), "content": str(data.get("content", ""))}
-        )
-    elif isinstance(data.get("data"), list):
-        for item in data["data"]:
-            transactions.append(
-                {"amount": int(item.get("amount", 0)), "content": str(item.get("description", ""))}
-            )
+    if isinstance(data, dict):
+        if "transferAmount" in data or "amount" in data:
+            raw_amt = data.get("transferAmount") if "transferAmount" in data else data.get("amount")
+            raw_content = data.get("content") or data.get("description") or ""
+            try:
+                amt = int(float(raw_amt or 0))
+            except Exception:
+                amt = 0
+            transactions.append({"amount": amt, "content": str(raw_content)})
+        elif isinstance(data.get("data"), list):
+            for item in data["data"]:
+                raw_amt = item.get("amount") or item.get("transferAmount") or 0
+                raw_content = item.get("description") or item.get("content") or ""
+                try:
+                    amt = int(float(raw_amt or 0))
+                except Exception:
+                    amt = 0
+                transactions.append({"amount": amt, "content": str(raw_content)})
+    elif isinstance(data, list):
+        for item in data:
+            raw_amt = item.get("amount") or item.get("transferAmount") or 0
+            raw_content = item.get("description") or item.get("content") or ""
+            try:
+                amt = int(float(raw_amt or 0))
+            except Exception:
+                amt = 0
+            transactions.append({"amount": amt, "content": str(raw_content)})
+
+    if not transactions:
+        print("⚠️ [BANK WEBHOOK] Không tìm thấy giao dịch nào trong payload!")
+        return web.json_response({"success": True, "message": "No transactions found"})
 
     for tx in transactions:
         amt = tx["amount"]
@@ -5715,27 +5740,72 @@ async def handle_bank_webhook(request: web.Request):
         if amt <= 0:
             continue
 
-        # Tìm mã TICKETxxxx trong nội dung chuyển khoản
-        m = re.search(r"TICKET\s*(\d{4})", desc.upper())
+        print(f"💰 [BANK WEBHOOK] Đang xử lý giao dịch: +{format_vnd(amt)} | Nội dung: '{desc}'")
+
+        # Tìm mã TICKETxxxx (4-8 chữ số) trong nội dung chuyển khoản
+        m = re.search(r"TICKET\s*(\d+)", desc.upper())
         target_code = m.group(1) if m else None
 
+        sent_to_ticket = False
         for guild in bot.guilds:
             for ch in guild.text_channels:
-                if target_code and ch.name.endswith(f"-{target_code}"):
-                    embed = discord.Embed(
-                        title="✅ THANH TOÁN THÀNH CÔNG (AUTO CHECK BILL)",
+                if target_code:
+                    matched = (
+                        ch.name.endswith(f"-{target_code}")
+                        or f"ticket{target_code}" in ch.name.lower()
+                        or (ch.topic and f"TICKET{target_code}" in ch.topic.upper())
+                    )
+                    if matched:
+                        embed = discord.Embed(
+                            title="✅ THANH TOÁN THÀNH CÔNG (AUTO CHECK BILL)",
+                            description=(
+                                f"**✅ Đã nhận được {format_vnd(amt)}! Nhân viên sẽ bàn giao ngay cho bạn.**\n\n"
+                                f"```text\n"
+                                f"Số tiền nhận : {format_vnd(amt)}\n"
+                                f"Nội dung CK  : {desc}\n"
+                                f"Thời gian    : {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m/%Y')}\n"
+                                f"```"
+                            ),
+                            color=COLOR_SUCCESS,
+                            timestamp=datetime.now(VN_TZ),
+                        )
+                        try:
+                            await ch.send(content="🔔 @here | **Đã nhận thanh toán tự động thành công!**", embed=embed)
+                            sent_to_ticket = True
+                            print(f"✅ Đã gửi thông báo xác nhận bill vào phòng #{ch.name}")
+                        except Exception as e:
+                            print(f"⚠️ Lỗi gửi tin nhắn vào #{ch.name}: {e}")
+
+            # Nếu không tìm thấy Ticket khớp mã (hoặc khách không ghi mã TICKETxxxx)
+            # Gửi thông báo về kênh ticket-logs hoặc kênh thông báo của Store để không bị sót bill!
+            if not sent_to_ticket:
+                settings = get_guild_settings(guild.id)
+                log_ch_id = settings.get("ticket_log_channel_id", 0)
+                log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+                if not log_ch:
+                    log_ch = discord.utils.find(
+                        lambda c: "bill" in c.name.lower() or "bank" in c.name.lower() or "log" in c.name.lower(),
+                        guild.text_channels,
+                    )
+
+                if log_ch:
+                    fallback_embed = discord.Embed(
+                        title="💰 NHẬN TIỀN NGÂN HÀNG (CHƯA RÕ PHÒNG TICKET)",
                         description=(
-                            f"**✅ Đã nhận được {format_vnd(amt)}! Nhân viên sẽ bàn giao acc ngay cho bạn.**\n\n"
+                            f"Hệ thống vừa nhận được một khoản thanh toán nhưng **nội dung chuyển khoản không khớp với mã Ticket nào đang mở**!\n\n"
                             f"```text\n"
                             f"Số tiền nhận : {format_vnd(amt)}\n"
                             f"Nội dung CK  : {desc}\n"
                             f"Thời gian    : {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m/%Y')}\n"
-                            f"```"
+                            f"```\n"
+                            f"👉 *Admin/Staff hãy kiểm tra nội dung để chốt đơn bằng lệnh `>done @khách {amt}` nhé!*"
                         ),
-                        color=COLOR_SUCCESS,
+                        color=COLOR_GOLD,
+                        timestamp=datetime.now(VN_TZ),
                     )
                     try:
-                        await ch.send(embed=embed)
+                        await log_ch.send(embed=fallback_embed)
+                        print(f"⚠️ Đã gửi thông báo dự phòng vào kênh #{log_ch.name}")
                     except Exception:
                         pass
 
