@@ -49,7 +49,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Token bảo mật SePay/Casso (tùy chọn)
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", 8080)))
 
 # Cấu hình đường dẫn Database SQLite lưu trữ vĩnh viễn (Railway Persistent Volume)
 railway_vol = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
